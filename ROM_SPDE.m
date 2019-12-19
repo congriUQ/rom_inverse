@@ -29,7 +29,7 @@ classdef ROM_SPDE < handle
         %Array holding fine scale data output; possibly large
         fineScaleDataOutput
         %number of samples per generated matfile
-        nSets = [4096 4096]
+        nSets = [128 128]
         %Output data characteristics
         outputVariance
         outputMean
@@ -267,7 +267,7 @@ classdef ROM_SPDE < handle
             
             %% Generate finescale domain
             tic
-            disp('Generate finescale domain...')
+            disp('Generate fine scale domain...')
             addpath('./heatFEM')    %to find Domain class
             self.fineMesh = Domain(self.nElFX, self.nElFY);
             %Only fix lower left corner as essential node
@@ -283,6 +283,7 @@ classdef ROM_SPDE < handle
             
             %Generate finescale conductivity samples and solve FEM
             for i = 1:numel(self.nSets)
+                i
                 filename = strcat(self.fineScaleDataPath, 'set', num2str(i),...
                     '-samples=', num2str(self.nSets(i)));
                 self.solveFEM(i, filename);
@@ -466,11 +467,6 @@ classdef ROM_SPDE < handle
             addpath('./rom');
             ticBytes(gcp)
             parfor i = 1:self.nSets(nSet)
-                %Conductivity matrix D, only consider isotropic materials here
-                if globalVariationTest
-                    cond{i}(E == 10) = cond10;
-                end
-                
                 if(any(bcVariance))
                     bcTemperature = @(x) bc{i}(1) + bc{i}(2)*x(1) +...
                         bc{i}(3)*x(2) + bc{i}(4)*x(1)*x(2);
@@ -1990,7 +1986,7 @@ classdef ROM_SPDE < handle
                 ld = self.latentDim;
                 ticBytes(gcp)
                 %for cheap features, serial evaluation might be more efficient
-                parfor s = 1:nData
+                for s = 1:nData
                     %inputs belonging to same coarse element are in 
                     %the same column of xk. They are ordered in x-direction.
                     
@@ -2019,35 +2015,6 @@ classdef ROM_SPDE < handle
                             end
                         end
                     end
-%NEEDS TO BE UNCOMMENTED FOR USE OF CONVECTION FIELD! NOT POSSIBLE WITH PARFOR
-% if uc
-%     %construct convection design matrix
-%     for i = 1:nElc
-%         %local features
-%         for j = 1:nConvectionFeatureFunctions
-%             %only take pixels of corresponding macro-cell as input for features
-%             PhiCell{s}(i, j + nFeatureFunctions + nGlobalFeatureFunctions + ld) =...
-%                 phiConvection{i, j}(ak{s, i});
-%         end
-%         %global features
-%         for j = 1:nGlobalConvectionFeatureFunctions
-%             %Take whole microstructure as input for feature function
-%             %Might be wrong for non-square fine scale domains
-%             convectionMat = reshape(convectionField{s}, 2, nElXf, nElYf);
-%             PhiCell{s}(i, j + nFeatureFunctions + nGlobalFeatureFunctions...
-%                 + ld + nConvectionFeatureFunctions) =...
-%                 phiGlobalConvection{i, j}(convectionMat);
-%         end
-%     end
-%     %Fill in lower right elements of design matrix. These are predictors for
-%     %convection field A
-%     PhiCell{s}((nElc + 1):(2*nElc), (nTotalFeatures + 1):2*(nTotalFeatures)) =...
-%         PhiCell{s}(1:nElc, 1:nTotalFeatures);
-%     PhiCell{s}((2*nElc + 1):end, (2*nTotalFeatures + 1):end) =...
-%         PhiCell{s}(1:nElc, 1:nTotalFeatures);
-% else
-%     %do nothing. for parfor
-% end
                 end
                 tocBytes(gcp)
                 
@@ -2081,7 +2048,6 @@ classdef ROM_SPDE < handle
                         end
                     end
                 end
-%                 obj.designMatrix = PhiCell;
                 %Check for real finite inputs
                 for i = 1:nData
                     if(~all(all(all(isfinite(PhiCell{i})))))
@@ -3515,8 +3481,7 @@ classdef ROM_SPDE < handle
                 
                 isotropicDiffusivity = true;
                 if isotropicDiffusivity
-                    coarseFEMout =...
-                        heat2d_v2(self.coarseMesh, Lambda_eff_mode);
+                    coarseFEMout = heat2d(self.coarseMesh, Lambda_eff_mode);
                 else
                     D = zeros(2, 2, self.coarseMesh.nEl);
                     for j = 1:self.coarseMesh.nEl
@@ -3525,10 +3490,12 @@ classdef ROM_SPDE < handle
                     coarseFEMout = heat2d(self.coarseMesh, D);
                 end
                 
-                Tc = coarseFEMout.Tff';
+                Tc = coarseFEMout.u;
+                nxc = self.coarseMesh.nElX + 1;
+                nyc = self.coarseMesh.nElY + 1;
                 XXc = meshgrid(linspace(0, 1, self.coarseMesh.nElX + 1));
                 [~, YYc] = meshgrid(linspace(0, 1, self.coarseMesh.nElY + 1));
-                reconstructionHandle = surf(XXc, YYc, Tc, 'Parent', sb3);
+                reconstructionHandle = surf(XXc, YYc, reshape(Tc, nxc, nyc), 'Parent', sb3);
                 reconstructionHandle.LineStyle = 'none';
                 reconstructionHandle.FaceColor = 'b';
                 hold(sb3, 'on');

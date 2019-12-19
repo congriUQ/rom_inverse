@@ -1,5 +1,4 @@
-function [log_p, d_log_p, Tc] =...
-    log_p_cf(Tf_i_minus_mu, domainc, Xi, theta_cf, condTransOpts, onlyGrad)
+function [log_p, d_log_p, Tc] = log_p_cf(Tf_i_minus_mu, domainc, Xi, theta_cf, condTransOpts, onlyGrad)
 %Coarse-to-fine map
 %ignore constant prefactor
 %log_p = -.5*logdet(S, 'chol') - .5*(Tf - mu)'*(S\(Tf - mu));
@@ -14,10 +13,10 @@ conductivity = conductivityBackTransform(Xi, condTransOpts);
 % 
 % FEMout = heat2d(domainc, D);
 
-FEMout = heat2d_v2(domainc, conductivity);
 
-Tc = FEMout.Tff';
-Tc = Tc(:);
+FEMout = heat2d(domainc, conductivity);
+
+Tc = FEMout.u;
 Tf_i_minus_mu_minus_WTc = Tf_i_minus_mu - theta_cf.W*Tc;
 if onlyGrad
     %to avoid computation overhead if only d_log_p is needed
@@ -31,7 +30,8 @@ end
 if nargout > 1
     %Gradient of FEM equation system w.r.t. conductivities
 
-    d_r = FEMgrad(FEMout, domainc, conductivity);
+%     d_r = FEMgrad(FEMout, domainc, conductivity);
+    d_r = FEMgrad2(FEMout.naturalTemperatures, domainc);
 %     d_rx = d_r;
     if strcmp(condTransOpts.type, 'log')
         %We need gradient of r w.r.t. log conductivities X, multiply 

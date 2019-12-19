@@ -28,6 +28,7 @@ classdef Domain
                                     %In the thrid line, the equation number is stored
         globalNodeNumber            %globalNodeNumber holds the global node number, given the element number as row
                                     %and the local node number as column indices
+        essentialNodeInElement
         Bvec                        %Shape function gradient array, precomputed for performance
         d_N                         %Shape function gradient array for Gauss quadrature of convection matrix
         NArray
@@ -45,11 +46,14 @@ classdef Domain
         fs                          %local forces due to heat source
         fh                          %local forces due to natural boundary
         f_tot                       %sum of fs and fh
+        F_natural                   %glob force due to sources and flux
         
         compute_grad = false        %should gradients be computed? memory
                                     %overhead!!
         d_loc_stiff                 %local stiffness gradient
         d_glob_stiff                %global stiffness gradient
+        d_glob_stiff_assemble       %permuted version of d_glob_stiff for fast
+                                    %stiffness assembly
         
         d_glob_force                %global force gradient
     end
@@ -553,6 +557,8 @@ classdef Domain
             self.f_tot = self.fh + self.fs;
             self = setNodalCoordinates(self);
             self = setBvec(self);
+            self = self.get_essential_node_in_element;
+            self = self.get_glob_natural_force;
 
         end
 
@@ -595,19 +601,67 @@ classdef Domain
         
         function self = get_glob_stiff_grad(self)
             %gives global stiffness matrix gradient
+%             for e = 1:self.nEl
+%                 grad_loc_k = zeros(4, 4, self.nEl);
+%                 grad_loc_k(:, :, e) = self.d_loc_stiff(:, :, e);
+%                 self.d_glob_stiff{e} = sparse(self.Equations(:, 1),...
+%                     self.Equations(:, 2), grad_loc_k(self.kIndex));
+%             end
+            self.d_glob_stiff = [];
+            self.d_glob_stiff_assemble = zeros(self.nEq*self.nEq, self.nEl);
             for e = 1:self.nEl
                 grad_loc_k = zeros(4, 4, self.nEl);
                 grad_loc_k(:, :, e) = self.d_loc_stiff(:, :, e);
-                self.d_glob_stiff{e} = sparse(self.Equations(:, 1),...
-                    self.Equations(:, 2), grad_loc_k(self.kIndex));
+                d_Ke = sparse(self.Equations(:, 1), self.Equations(:, 2), grad_loc_k(self.kIndex));
+                self.d_glob_stiff = [self.d_glob_stiff; d_Ke];
+                self.d_glob_stiff_assemble(:, e) = d_Ke(:);
             end
+            self.d_glob_stiff_assemble = sparse(self.d_glob_stiff_assemble);
         end
         
+%         function self = get_glob_force_grad(self)
+%             %compute global force gradient
+%             for e = 1:self.nEl
+%                 self.d_glob_force{e} = get_glob_force_gradient(self, ...
+%                     self.d_loc_stiff(:, :, e), e);
+%             end
+%         end
+
         function self = get_glob_force_grad(self)
-            %compute global force gradient
+            %compute global force gradient matrix
             for e = 1:self.nEl
-                self.d_glob_force{e} = get_glob_force_gradient(self, ...
-                    self.d_loc_stiff(:, :, e), e);
+                self.d_glob_force(e, :) = get_glob_force_gradient(self, ...
+                    self.d_loc_stiff(:, :, e), e)';
+            end
+            self.d_glob_force = sparse(self.d_glob_force);
+        end
+        
+        function self = get_essential_node_in_element(self)
+            %true if element contains essential node, false if not
+            
+            self.essentialNodeInElement = false(self.nEl, 4);
+            for e = 1:self.nEl
+                for i = 1:4
+                    self.essentialNodeInElement(e, i) =...
+                        any(self.globalNodeNumber(e, i) == self.essentialNodes);
+                end
+            end
+            
+        end
+        
+        function self = get_glob_natural_force(self)
+            % independent of diffusivity and can be precomputed
+            
+            self.F_natural = zeros(self.nEq, 1);
+            % for performance
+            for e = 1:self.nEl
+                for ln = 1:4
+                    eqn = self.lm(e, ln);
+                    if(eqn ~= 0)
+                        self.F_natural(eqn) =...
+                            self.F_natural(eqn) + self.f_tot(ln, e);
+                    end
+                end
             end
         end
     end

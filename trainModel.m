@@ -255,7 +255,7 @@ while true
         
         tic
         ticBytes(gcp)
-        for i = pstart:pend
+        parfor i = pstart:pend
             [varDistParams{i}, varDistParamsVec{i}] = efficientStochOpt(...
                 varDistParamsVec{i}, log_qi{i}, variationalDist, sw, dim);
         end

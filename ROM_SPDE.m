@@ -8,7 +8,7 @@ classdef ROM_SPDE < handle
         nElFY = 256
         %Finescale conductivities, binary material
         lowerConductivity = 1
-        upperConductivity = 2
+        upperConductivity = 100
         %Conductivity field distribution type
         conductivityDistribution = 'squaredExponential'
         %Boundary condition functions
@@ -29,7 +29,7 @@ classdef ROM_SPDE < handle
         %Array holding fine scale data output; possibly large
         fineScaleDataOutput
         %number of samples per generated matfile
-        nSets = [128 128]
+        nSets = [4096 4096]
         %Output data characteristics
         outputVariance
         outputMean
@@ -38,7 +38,7 @@ classdef ROM_SPDE < handle
         neighborDictionary %Gives neighbors of macrocells
         %% Model training parameters
         nStart = 1              %first training data sample in file
-        nTrain = 4             %number of samples used for training
+        nTrain = 32             %number of samples used for training
         mode = 'none'           %useNeighbor, useLocalNeighbor, useDiagNeighbor,
                                 %useLocalDiagNeighbor, useLocal, global
                                 %global: take whole microstructure as feature 
@@ -167,7 +167,7 @@ classdef ROM_SPDE < handle
         advectionDistributionParams = [10, 15]
         
         %Coefficients giving boundary conditions, specify as string
-        boundaryConditions = '[0 800 1200 -2000]'
+        boundaryConditions = '[0 1 1 0]'
         boundaryConditionVariance = [0 0 0 0]
         
         %% Coarse model specifications
@@ -187,6 +187,7 @@ classdef ROM_SPDE < handle
     methods
         function self = ROM_SPDE(mode)
             %Constructor
+            addpath('./FEMgradient')
             %Create data directory
             if ~exist('./data/', 'dir')
                 mkdir('./data/');
@@ -248,7 +249,6 @@ classdef ROM_SPDE < handle
         
         function genFineScaleData(self, boundaryConditions, condDistParams)
             %Function to generate and save finescale data
-            
             disp('Generate fine scale data...')
             
             if(nargin > 1)
@@ -271,8 +271,7 @@ classdef ROM_SPDE < handle
             addpath('./heatFEM')    %to find Domain class
             self.fineMesh = Domain(self.nElFX, self.nElFY);
             %Only fix lower left corner as essential node
-            self.fineMesh = setBoundaries(self.fineMesh,...
-                self.naturalNodes, self.boundaryTemperature,...
+            self.fineMesh = setBoundaries(self.fineMesh, self.naturalNodes, self.boundaryTemperature,...
                 self.boundaryHeatFlux);
             disp('done')
             domain_generating_time = toc
@@ -283,7 +282,6 @@ classdef ROM_SPDE < handle
             
             %Generate finescale conductivity samples and solve FEM
             for i = 1:numel(self.nSets)
-                i
                 filename = strcat(self.fineScaleDataPath, 'set', num2str(i),...
                     '-samples=', num2str(self.nSets(i)));
                 self.solveFEM(i, filename);
@@ -291,8 +289,8 @@ classdef ROM_SPDE < handle
             
             %save params
             fineMesh = self.fineMesh;
-            save(strcat(self.fineScaleDataPath, 'fineMesh.mat'),...
-                'fineMesh');
+            fineMesh = fineMesh.shrink();
+            save(strcat(self.fineScaleDataPath, 'fineMesh.mat'), 'fineMesh');
             disp('done')
         end
         
@@ -449,6 +447,8 @@ classdef ROM_SPDE < handle
             disp('Solving finescale problem...')
             tic
             Tf = zeros(self.fineMesh.nNodes, self.nSets(nSet));
+            %cell array for parfor
+            Tf = mat2cell(Tf, self.fineMesh.nNodes, ones(1, self.nSets(nSet)));
 
             %To avoid broadcasting overhead
             fineMesh = self.fineMesh;
@@ -466,7 +466,8 @@ classdef ROM_SPDE < handle
             parPoolInit(self.nSets(nSet));
             addpath('./rom');
             ticBytes(gcp)
-            parfor i = 1:self.nSets(nSet)
+            bcHeatFlux = [];
+            for i = 1:self.nSets(nSet)
                 if(any(bcVariance))
                     bcTemperature = @(x) bc{i}(1) + bc{i}(2)*x(1) +...
                         bc{i}(3)*x(2) + bc{i}(4)*x(1)*x(2);
@@ -484,18 +485,16 @@ classdef ROM_SPDE < handle
 %                     bcHeatFlux = [];
                 else
                     fineMeshTemp = fineMesh;
-%                     bcHeatFlux = [];
 %                     bcTemperature = [];
                 end
-
-                FEMout = heat2d_v2(fineMeshTemp, cond{i});
+                FEMout = heat2d(fineMeshTemp, cond{i});
                 %Store fine temperatures as a vector Tf. 
                 %Use reshape(Tf(:, i), domain.nElX + 1, domain.nElY + 1)
                 %and then transpose result to reconvert it to
                 %original temperature field
-                Ttemp = FEMout.Tff';
-                Tf(:, i) = Ttemp(:);
+                Tf{i} = FEMout.u;
             end
+            Tf = cell2mat(Tf);
             tocBytes(gcp)
             disp('FEM systems solved')
             tot_FEM_time = toc
@@ -584,14 +583,9 @@ classdef ROM_SPDE < handle
         
         function loadTrainingData(self)
             %load data params; warning for variable FD can be ignored
-            try
-                load(strcat(self.fineScaleDataPath, 'fineMesh.mat'));
-                self.fineMesh = fineMesh;
-            catch
-                load(strcat(self.fineScaleDataPath,...
-                    'fineScaleDomain.mat'));
-                self.fineMesh = fineScaleDomain;
-            end
+            self.fineScaleDataPath
+            load(strcat(self.fineScaleDataPath, 'fineMesh.mat'));
+            self.fineMesh = fineMesh;
             %for finescale domain class
             addpath('./heatFEM')
             %for boundary condition functions
@@ -1433,8 +1427,7 @@ classdef ROM_SPDE < handle
                     coarseDomain = cd;
                 end
                 for i = 1:nSamples
-%                     FEMout = heat2d(coarseDomain, LambdaSamples{j}(:, i));
-                    FEMout = heat2d_v2(coarseDomain, LambdaSamples{j}(:, i));
+                    FEMout = heat2d(coarseDomain, LambdaSamples{j}(:, i));
                     Tctemp = FEMout.Tff';
                     
                     %sample from p_cf
@@ -1689,7 +1682,6 @@ classdef ROM_SPDE < handle
                             D(:, :, e) = LambdaSamples{n, t}(e, i)*eye(2);
                         end
                         
-%                         FEMout = heat2d(coarseDomain, D);
                         FEMout= heat2d(coarseDomain, LambdaSamples{n, t}(:, i));
                         Tctemp = FEMout.Tff';
                         

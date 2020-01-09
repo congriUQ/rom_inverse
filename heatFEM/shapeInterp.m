@@ -40,6 +40,7 @@ Nvec = zeros(4*domainf.nNodes, 1);
 is = 1;
 ie = 4;
 %r is the finescale global node number and the row index of W
+domainf
 for r = 1:domainf.nNodes
     %coordinate of fine node
     x(1) = domainf.nodalCoordinates(1, r);

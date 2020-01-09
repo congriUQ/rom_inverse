@@ -276,9 +276,9 @@ classdef Domain
             end
             
             self = self.get_loc_stiff_grad();
+            self = self.get_glob_stiff_grad();
             if self.compute_grad
                 %gradient precomputation
-                self = self.get_glob_stiff_grad();
                 self = self.get_glob_force_grad();
             end
         end
@@ -563,7 +563,7 @@ classdef Domain
         end
 
         function self = shrink(self)
-            %To save memory. We use that on finescale domain to save memory
+            % We use that on finescale domain to save memory
             self.lc = [];
             self.Equations = [];
             self.kIndex = [];
@@ -578,7 +578,7 @@ classdef Domain
             self.ly = [];
             self.AEl = [];
             self.nEq = [];
-            self.nodalCoordinates = [];
+%             self.nodalCoordinates = [];
             self.globalNodeNumber =[];
             self.Bvec = [];
             self.essentialBoundary = [];
@@ -587,6 +587,8 @@ classdef Domain
             self.LocalNode = [];
             self.fs = [];
             self.fh = [];
+            self.d_glob_stiff = [];
+            self.d_glob_stiff_assemble = [];
         end
         
         function self = get_loc_stiff_grad(self)
@@ -608,14 +610,26 @@ classdef Domain
 %                     self.Equations(:, 2), grad_loc_k(self.kIndex));
 %             end
             self.d_glob_stiff = [];
-            self.d_glob_stiff_assemble = zeros(self.nEq*self.nEq, self.nEl);
+            self.d_glob_stiff_assemble = spalloc(self.nEq*self.nEq, self.nEl, 16*self.nEl);
+            kIndexMat = sparse(1:length(self.kIndex), self.kIndex, ones(1, length(self.kIndex)));
+            disp('Setting up stiffness stencil, this may take a while...')
+            tic
             for e = 1:self.nEl
-                grad_loc_k = zeros(4, 4, self.nEl);
-                grad_loc_k(:, :, e) = self.d_loc_stiff(:, :, e);
-                d_Ke = sparse(self.Equations(:, 1), self.Equations(:, 2), grad_loc_k(self.kIndex));
+%                 grad_loc_k = zeros(4, 4, self.nEl);
+%                 grad_loc_k(:, :, e) = self.d_loc_stiff(:, :, e);
+                grad_loc_k = sparse((16*(e - 1) + 1):(16*e), 1, reshape(self.d_loc_stiff(:, :, e), 16, 1),...
+                    16*self.nEl, 1);
+%                 grad_loc_k_vec = grad_loc_k(self.kIndex);
+                grad_loc_k_vec = kIndexMat*grad_loc_k;
+                i = find(grad_loc_k_vec);
+%                 d_Ke = sparse(self.Equations(:, 1), self.Equations(:, 2), grad_loc_k(self.kIndex));
+                d_Ke = sparse(self.Equations(i, 1), self.Equations(i, 2), grad_loc_k_vec(i), self.nEq, self.nEq);
+                % this is suboptimal, but works better than preallocating and assembling
                 self.d_glob_stiff = [self.d_glob_stiff; d_Ke];
-                self.d_glob_stiff_assemble(:, e) = d_Ke(:);
+                self.d_glob_stiff_assemble(:, e) = sparse(d_Ke(:));
             end
+            toc
+            disp('...stiffness stencil set up.')
             self.d_glob_stiff_assemble = sparse(self.d_glob_stiff_assemble);
         end
         
@@ -630,8 +644,7 @@ classdef Domain
         function self = get_glob_force_grad(self)
             %compute global force gradient matrix
             for e = 1:self.nEl
-                self.d_glob_force(e, :) = get_glob_force_gradient(self, ...
-                    self.d_loc_stiff(:, :, e), e)';
+                self.d_glob_force(e, :) = sparse(get_glob_force_gradient(self, self.d_loc_stiff(:, :, e), e)');
             end
             self.d_glob_force = sparse(self.d_glob_force);
         end

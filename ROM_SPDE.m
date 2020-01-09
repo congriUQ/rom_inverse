@@ -8,8 +8,10 @@ classdef ROM_SPDE < handle
         nElFY = 256
         %Finescale conductivities, binary material
         lowerConductivity = 1
-        upperConductivity = 100
+        upperConductivity = 10
         %Conductivity field distribution type
+        nBochnerBasis = 10  % Set to false if no fixed basis is desired
+        conductivityDistributionType = 'continuous'     %binary (default) or continuous
         conductivityDistribution = 'squaredExponential'
         %Boundary condition functions
         %evaluate those on boundaries to get boundary conditions
@@ -37,8 +39,8 @@ classdef ROM_SPDE < handle
         E                   %Mapping from fine to coarse cell index
         neighborDictionary %Gives neighbors of macrocells
         %% Model training parameters
-        nStart = 1              %first training data sample in file
-        nTrain = 32             %number of samples used for training
+        nStart = 17              %first training data sample in file
+        nTrain = 16             %number of samples used for training
         mode = 'none'           %useNeighbor, useLocalNeighbor, useDiagNeighbor,
                                 %useLocalDiagNeighbor, useLocal, global
                                 %global: take whole microstructure as feature 
@@ -81,7 +83,6 @@ classdef ROM_SPDE < handle
         convectionFeatureFunctions
         %cell array with handles to global convection feature functions
         globalConvectionFeatureFunctions
-        kernelHandles
         %transformation of finescale conductivity to real axis
         conductivityTransformation
         latentDim = 0              %If autoencoder is used
@@ -100,14 +101,7 @@ classdef ROM_SPDE < handle
         featureFunctionMin
         featureFunctionMax
         loadDesignMatrix = false
-        %Use linear combination of kernels in feature function space
-        useKernels = false
-        kernelBandwidth = 2    %only used if no rule of thumb is taken
-        %'fixed' for fixed kernel bandwidth, 'silverman' for
-        %silverman's rule of thumb 'scott' for scott's rule of thumb,
-        %see wikipedia on multivariate kernel density estimation
-        bandwidthSelection = 'silverman'
-        kernelType = 'squaredExponential'
+
         
         %% Prediction parameters
         nSamples_p_c = 1000
@@ -140,8 +134,8 @@ classdef ROM_SPDE < handle
         varExpect_p_cf_exp_mean
         XMean                  %Expected value of X under q
         XSqMean                %<X^2>_q
-        mean_TfTcT
-        mean_TcTcT
+        mean_ufucT
+        mean_ucucT
         thetaArray
         thetaHyperparamArray
         sigmaArray
@@ -162,7 +156,7 @@ classdef ROM_SPDE < handle
         %for log normal length scale, the
         %length scale parameters are log normal mu and
         %sigma
-        conductivityDistributionParams = {-1 [.01 .01] 1}
+        conductivityDistributionParams = {-1 [.2 .2] 1}
         %mu and sigma for advection field coefficients
         advectionDistributionParams = [10, 15]
         
@@ -172,15 +166,14 @@ classdef ROM_SPDE < handle
         
         %% Coarse model specifications
         coarseMesh
-        coarseGridVectorX = (1/8)*ones(1, 8)
-        coarseGridVectorY = (1/8)*ones(1, 8)
+        coarseGridVectorX = (1/4)*ones(1, 4)
+        coarseGridVectorY = (1/4)*ones(1, 4)
         
         %Design matrices. Cell index gives data point, row index coarse cell, 
         %and column index feature function
         designMatrix
         originalDesignMatrix    %design matrix without any locality mode
         testDesignMatrix    %design matrices on independent test set
-        kernelMatrix
     end
     
     
@@ -272,7 +265,7 @@ classdef ROM_SPDE < handle
             self.fineMesh = Domain(self.nElFX, self.nElFY);
             %Only fix lower left corner as essential node
             self.fineMesh = setBoundaries(self.fineMesh, self.naturalNodes, self.boundaryTemperature,...
-                self.boundaryHeatFlux);
+                                          self.boundaryHeatFlux);
             disp('done')
             domain_generating_time = toc
             
@@ -282,8 +275,7 @@ classdef ROM_SPDE < handle
             
             %Generate finescale conductivity samples and solve FEM
             for i = 1:numel(self.nSets)
-                filename = strcat(self.fineScaleDataPath, 'set', num2str(i),...
-                    '-samples=', num2str(self.nSets(i)));
+                filename = strcat(self.fineScaleDataPath, 'set', num2str(i), '-samples=', num2str(self.nSets(i)));
                 self.solveFEM(i, filename);
             end
             
@@ -308,121 +300,81 @@ classdef ROM_SPDE < handle
             self.boundaryHeatFlux{4} = @(y) -(bc(2) + bc(4)*y);    %left bound
         end
         
-        function cond = generateConductivityField(self, nSet)
+        function [cond, xi] = generateConductivityField(self, nSet)
             %nSet is the number of the data set
             %nSet is the set (file number) index
             
             % Draw conductivity/ log conductivity
             disp('Generating finescale conductivity field...')
             tic
-            if strcmp(self.conductivityDistribution, 'uniform')
-                %conductivity uniformly distributed between lo and up
-                cond{1} = zeros(self.fineMesh.nEl, 1);
-                cond = repmat(cond, 1, self.nSets(nSet));
-                for i = 1:self.nSets(nSet)
-                    cond{i} = (self.upperConductivity -...
-                        self.lowerConductivity)*...
-                        rand(self.fineMesh.nEl, 1) +...
-                        self.lowerConductivity;
-                end
-            elseif strcmp(self.conductivityDistribution, 'gaussian')
-                %log conductivity gaussian distributed
-                x = normrnd(self.conductivityDistributionParams{1},...
-                    self.conductivityDistributionParams{2},...
-                    self.fineMesh.nEl, self.nSets(nSet));
-                cond{1} = zeros(self.fineMesh.nEl, 1);
-                cond = repmat(cond, 1, self.nSets(nSet));
-                for i = 1:self.nSets(nSet)
-                    cond{i} = exp(x(:, i));
-                end
-            elseif strcmp(self.conductivityDistribution, 'binary')
-                %binary distribution of conductivity (Bernoulli)
-                cond{1} = zeros(self.fineMesh.nEl, 1);
-                cond = repmat(cond, 1, self.nSets(nSet));
-                for i = 1:self.nSets(nSet)
-                    r = rand(self.fineMesh.nEl, 1);
-                    cond{i} = self.lowerConductivity*...
-                        ones(self.fineMesh.nEl, 1);
-                    cond{i}(r < self.conductivityDistributionParams{1}) =...
-                        self.upperConductivity;
-                end
-            elseif(strcmp(self.conductivityDistribution,'squaredExponential')...
-                 || strcmp(self.conductivityDistribution,'ornsteinUhlenbeck')...
-                 || strcmp(self.conductivityDistribution, 'sincCov') ...
-                 || strcmp(self.conductivityDistribution, 'sincSqCov')...
-                 || strcmp(self.conductivityDistribution, 'matern'))
-                %ATTENTION: only isotrop. distributions (length scales) possible
-                %Compute coordinates of element centers
-                x = .5*(self.fineMesh.cum_lElX(1:(end - 1)) +...
-                    self.fineMesh.cum_lElX(2:end));
-                y = .5*(self.fineMesh.cum_lElY(1:(end - 1)) +...
-                    self.fineMesh.cum_lElY(2:end));
-                [X, Y] = meshgrid(x, y);
-                %directly clear potentially large arrays
-                clear y;
-                x = [X(:) Y(:)]';
-                clear X Y;
-                
-                addpath('./computation')        %to find parPoolInit
-                parPoolInit(self.nSets(nSet));
-                %Store conductivity fields in cell array to avoid 
-                %broadcasting the whole data
-                cond{1} = zeros(self.fineMesh.nEl, 1);
-                cond = repmat(cond, 1, self.nSets(nSet));
-                
-                addpath('./genConductivity')        %to find genBochnerSamples
-                nBochnerBasis = 1e3;    %Number of cosine basis functions
+            %ATTENTION: only isotrop. distributions (length scales) possible. Compute coordinates of element centers
+            x = .5*(self.fineMesh.cum_lElX(1:(end - 1)) + self.fineMesh.cum_lElX(2:end));
+            y = .5*(self.fineMesh.cum_lElY(1:(end - 1)) + self.fineMesh.cum_lElY(2:end));
+            [X, Y] = meshgrid(x, y);
+            %directly clear potentially large arrays
+            clear y;
+            x = [X(:) Y(:)]';
+            clear X Y;
+            
+            addpath('./computation')        %to find parPoolInit
+            parPoolInit(self.nSets(nSet));
+            %Store conductivity fields in cell array to avoid broadcasting the whole data
+            cond = repmat({zeros(self.fineMesh.nEl, 1)}, 1, self.nSets(nSet));
+            l = self.conductivityDistributionParams{2};
+            
+            addpath('./genConductivity')        %to find genBochnerSamples
+            if self.nBochnerBasis
+                %Fixed random field basis functions; the only random parameter is the coefficient xi
+                fprintf('Using fixed basis of %u Bochner samples. Randomized length scale not possible.',...
+                    self.nBochnerBasis)
+                [sampleFuns, xi] = genBochnerSamplesFixedBasis(l, self.conductivityDistributionParams{3}, ...
+                    self.nBochnerBasis, self.nSets(nSet), self.conductivityDistribution);
+            else
                 for i = 1:(self.nSets(nSet))
-                    if strcmp(self.conductivityLengthScaleDist, 'delta')
-                        %one fixed length scale for all samples
-                        l = self.conductivityDistributionParams{2};
-                    elseif strcmp(self.conductivityLengthScaleDist, 'lognormal')
-                        %First and second parameters are mu and sigma 
-                        %of lognormal dist
-                        l = lognrnd(...
-                            self.conductivityDistributionParams{2}(1),...
+                    if strcmp(self.conductivityLengthScaleDist, 'lognormal')
+                        %First and second parameters are mu and sigma of lognormal dist
+                        l = lognrnd(self.conductivityDistributionParams{2}(1), ...
                             self.conductivityDistributionParams{2}(2));
-                        l = [l l];
+                        l = [l, l];
                     else
                         error('Unknown length scale distribution')
                     end
-                    p{i} = genBochnerSamples(l,...
-                        self.conductivityDistributionParams{3},...
-                        nBochnerBasis, self.conductivityDistribution);
+                    sampleFuns{i} = genBochnerSamples(l, self.conductivityDistributionParams{3}, self.nBochnerBasis,...
+                        self.conductivityDistribution);
+                    xi = [];
                 end
-                nEl = self.fineMesh.nEl;
-                upCond = self.upperConductivity;
-                loCond = self.lowerConductivity;
-                %set volume fraction parameter < 0 to have
-                %uniformly random volume fraction
-                if(self.conductivityDistributionParams{1} >= 0)
-                    cutoff = norminv(1 -...
-                        self.conductivityDistributionParams{1},...
-                        0, self.conductivityDistributionParams{3});
+            end
+            nEl = self.fineMesh.nEl;
+            upCond = self.upperConductivity;
+            loCond = self.lowerConductivity;
+            %set volume fraction parameter < 0 to have
+            %uniformly random volume fraction
+            if(self.conductivityDistributionParams{1} >= 0)
+                cutoff = norminv(1 - self.conductivityDistributionParams{1}, 0, self.conductivityDistributionParams{3});
+            else
+                cutoff = zeros(self.nSets(nSet), 1);
+                for i = 1:(self.nSets(nSet))
+                    phiRand = rand;
+                    cutoff(i) = norminv(1 - phiRand, 0,...
+                        self.conductivityDistributionParams{3});
+                end
+            end
+            volfrac = self.conductivityDistributionParams{1};
+            conductivityDistributionType = self.conductivityDistributionType;
+            parfor i = 1:(self.nSets(nSet))
+                %use for-loop instead of vectorization to save memory
+                if strcmp(conductivityDistributionType, 'continuous')
+                    cond{i} = loCond + exp(sampleFuns{i}(x))';
                 else
-                    cutoff = zeros(self.nSets(nSet), 1);
-                    for i = 1:(self.nSets(nSet))
-                        phiRand = rand;
-                        cutoff(i) = norminv(1 - phiRand, 0,...
-                            self.conductivityDistributionParams{3});
-                    end
-                end
-                volfrac = self.conductivityDistributionParams{1};
-                parfor i = 1:(self.nSets(nSet))
-                    %use for-loop instead of vectorization to save memory
                     for j = 1:nEl
-                        ps = p{i}(x(:, j));
+                        ps = sampleFuns{i}(x(:, j));
                         if(volfrac >= 0)
-                            cond{i}(j) =...
-                                upCond*(ps > cutoff) + loCond*(ps <= cutoff);
+                            cond{i}(j) = upCond*(ps > cutoff) + loCond*(ps <= cutoff);
                         else
-                            cond{i}(j) = upCond*(ps > cutoff(i)) +...
-                                loCond*(ps <= cutoff(i));
+                            cond{i}(j) = upCond*(ps > cutoff(i)) + loCond*(ps <= cutoff(i));
                         end
                     end
                 end
-            else
-                error('unknown FOM conductivity distribution');
             end
             disp('done')
             conductivity_generation_time = toc
@@ -430,25 +382,13 @@ classdef ROM_SPDE < handle
         
         function solveFEM(self, nSet, savepath)
             
-            cond = self.generateConductivityField(nSet);
-            %Every microstructure has a common macro-cell
-            globalVariationTest = false;
-            if globalVariationTest
-                self.getCoarseElement;
-                %Conductivity of 10th window is the same in all samples
-                cond10 = cond{1}(self.E(:) == 10);
-                E = self.E(:); %for parfor
-            else
-                %for parfor
-                E = [];
-                cond10 = [];
-            end
+            [cond, xi] = self.generateConductivityField(nSet);
             %Solve finite element model
             disp('Solving finescale problem...')
             tic
-            Tf = zeros(self.fineMesh.nNodes, self.nSets(nSet));
+            uf = zeros(self.fineMesh.nNodes, self.nSets(nSet));
             %cell array for parfor
-            Tf = mat2cell(Tf, self.fineMesh.nNodes, ones(1, self.nSets(nSet)));
+            uf = mat2cell(uf, self.fineMesh.nNodes, ones(1, self.nSets(nSet)));
 
             %To avoid broadcasting overhead
             fineMesh = self.fineMesh;
@@ -465,7 +405,6 @@ classdef ROM_SPDE < handle
             
             parPoolInit(self.nSets(nSet));
             addpath('./rom');
-            ticBytes(gcp)
             bcHeatFlux = [];
             for i = 1:self.nSets(nSet)
                 if(any(bcVariance))
@@ -488,14 +427,13 @@ classdef ROM_SPDE < handle
 %                     bcTemperature = [];
                 end
                 FEMout = heat2d(fineMeshTemp, cond{i});
-                %Store fine temperatures as a vector Tf. 
-                %Use reshape(Tf(:, i), domain.nElX + 1, domain.nElY + 1)
+                %Store fine temperatures as a vector uf. 
+                %Use reshape(uf(:, i), domain.nElX + 1, domain.nElY + 1)
                 %and then transpose result to reconvert it to
                 %original temperature field
-                Tf{i} = FEMout.u;
+                uf{i} = FEMout.u;
             end
-            Tf = cell2mat(Tf);
-            tocBytes(gcp)
+            uf = cell2mat(uf);
             disp('FEM systems solved')
             tot_FEM_time = toc
             
@@ -505,9 +443,9 @@ classdef ROM_SPDE < handle
                 cond = cell2mat(cond);
                 %partial loading only for -v7.3
                 if(any(bcVariance))
-                    save(strcat(savepath, ''), 'cond', 'Tf', 'bc', '-v7.3')
+                    save(strcat(savepath, ''), 'cond', 'uf', 'xi', 'bc', '-v7.3')
                 else
-                    save(strcat(savepath, ''), 'cond', 'Tf', '-v7.3')
+                    save(strcat(savepath, ''), 'cond', 'uf', 'xi', '-v7.3')
                 end
                 disp('done')
             end
@@ -536,9 +474,14 @@ classdef ROM_SPDE < handle
                         self.conductivityDistribution, '/', 'l=',...
                         num2str(corrLength), '_sigmafSq=', num2str(sigma_f2),...
                         '/volumeFraction=', num2str(volFrac), '/', 'locond=',...
-                        num2str(self.lowerConductivity), '_upcond=',...
-                        num2str(self.upperConductivity),...
-                        '/', 'BCcoeffs=', self.boundaryConditions, '/');
+                        num2str(self.lowerConductivity))
+                    if strcmp(self.conductivityDistributionType, 'continuous')
+                        self.fineScaleDataPath = strcat(self.fineScaleDataPath, '_upcond=continuous')
+                    else
+                        self.fineScaleDataPath = strcat(self.fineScaleDataPath,...
+                            '_upcond=', num2str(self.upperConductivity))
+                    end
+                    self.fineScaleDataPath = strcat(self.fineScaleDataPath, '/BCcoeffs=', self.boundaryConditions, '/');
                 elseif strcmp(self.conductivityLengthScaleDist, 'lognormal')
                     corrLength1 = self.conductivityDistributionParams{2}(1);
                     corrLength2 = self.conductivityDistributionParams{2}(2);
@@ -604,7 +547,7 @@ classdef ROM_SPDE < handle
             end
             
             %load finescale temperatures partially
-            self.fineScaleDataOutput = self.trainingDataMatfile.Tf(:,...
+            self.fineScaleDataOutput = self.trainingDataMatfile.uf(:,...
                 self.nStart:(self.nStart + self.nTrain - 1));
         end
         
@@ -633,9 +576,9 @@ classdef ROM_SPDE < handle
         
         function estimateDataVariance(self)
             
-            Tftemp = self.trainingDataMatfile.Tf(:, 1);
-            Tf_true_mean = zeros(size(Tftemp));
-            Tf_true_sq_mean = zeros(size(Tftemp));
+            uftemp = self.trainingDataMatfile.uf(:, 1);
+            uf_true_mean = zeros(size(uftemp));
+            uf_true_sq_mean = zeros(size(uftemp));
             nSamples = self.nSets(1);
             window = nSamples;
             nWindows = ceil(nSamples/window);
@@ -646,27 +589,27 @@ classdef ROM_SPDE < handle
                 if final > nSamples
                     final = nSamples;
                 end
-                Tftemp = self.trainingDataMatfile.Tf(:, initial:final);
-                Tf_mean_temp = mean(Tftemp, 2);
-                Tf_sq_mean_temp = mean(Tftemp.^2, 2);
-                clear Tftemp;
-                Tf_true_mean = ((i - 1)/i)*Tf_true_mean + (1/i)*Tf_mean_temp;
-                Tf_true_sq_mean = ...
-                    ((i - 1)/i)*Tf_true_sq_mean + (1/i)*Tf_sq_mean_temp;
+                uftemp = self.trainingDataMatfile.uf(:, initial:final);
+                uf_mean_temp = mean(uftemp, 2);
+                uf_sq_mean_temp = mean(uftemp.^2, 2);
+                clear uftemp;
+                uf_true_mean = ((i - 1)/i)*uf_true_mean + (1/i)*uf_mean_temp;
+                uf_true_sq_mean = ...
+                    ((i - 1)/i)*uf_true_sq_mean + (1/i)*uf_sq_mean_temp;
             end
             
-            Tf_true_var = Tf_true_sq_mean - Tf_true_mean.^2;
-            self.outputMean = Tf_true_mean;
-            self.outputVariance = Tf_true_var;
-            self.meanOutputVariance = mean(Tf_true_var);
+            uf_true_var = uf_true_sq_mean - uf_true_mean.^2;
+            self.outputMean = uf_true_mean;
+            self.outputVariance = uf_true_var;
+            self.meanOutputVariance = mean(uf_true_var);
             toc
             
             %Mean log likelihood
-            Tf_true_var(self.fineMesh.essentialNodes) = NaN;
+            uf_true_var(self.fineMesh.essentialNodes) = NaN;
             nNatNodes = self.fineMesh.nNodes -...
                 numel(self.fineMesh.essentialNodes);
             Lm = -.5*log(2*pi) - .5 - .5*(1/nNatNodes)*...
-                sum(log(Tf_true_var), 'omitnan');
+                sum(log(uf_true_var), 'omitnan');
             sv = true;
             if sv
                 %     savedir = '~/matlab/data/trueMC/';
@@ -675,17 +618,17 @@ classdef ROM_SPDE < handle
                     mkdir(savedir);
                 end
                 save(strcat(savedir, 'trueMC', '_nSamples=',...
-                    num2str(nSamples), '.mat'), 'Tf_true_mean',...
-                    'Tf_true_var', 'Lm')
+                    num2str(nSamples), '.mat'), 'uf_true_mean',...
+                    'uf_true_var', 'Lm')
             end
         end
         
-        function [meanLogLikelihood, err]= estimateLogL(self, nTrainingData, Tf)
+        function [meanLogLikelihood, err]= estimateLogL(self, nTrainingData, uf)
             
             natNodes = true(self.fineMesh.nNodes, 1);
             natNodes(self.fineMesh.essentialNodes) = false;
             nNatNodes = sum(natNodes);
-            Tf = Tf(natNodes, :);
+            uf = uf(natNodes, :);
             meanLogLikelihood = 0;
             meanLogLikelihoodSq = 0;
             converged = false;
@@ -695,13 +638,13 @@ classdef ROM_SPDE < handle
                 randSamples_params = randSamples(1:nTrainingData);
                 randSamples_samples =...
                     randSamples((nTrainingData + 1):(2*nTrainingData));
-                Tftemp = Tf(:, randSamples_params);
-                mu_data = mean(Tftemp, 2);
-                var_data = var(Tftemp')';
+                uftemp = uf(:, randSamples_params);
+                mu_data = mean(uftemp, 2);
+                var_data = var(uftemp')';
                 
                 term1 = .5*log(geomean(var_data));
                 term2 = .5*mean(mean(...
-                    (Tf(:, randSamples_samples) - mu_data).^2, 2)./var_data);
+                    (uf(:, randSamples_samples) - mu_data).^2, 2)./var_data);
                 
                 meanLogLikelihood =...
                     ((i - 1)/i)*meanLogLikelihood + (1/i)*(term1 + term2);
@@ -744,8 +687,8 @@ classdef ROM_SPDE < handle
             j = 1;
             addpath('./tests/detOptP_cf')
             for i = nStart:(nStart + nTrain -1)
-                Tf = self.trainingDataMatfile.Tf(:, i);
-                objFun = @(X) objective(X, Tf, self.coarseMesh,...
+                uf = self.trainingDataMatfile.uf(:, i);
+                objFun = @(X) objective(X, uf, self.coarseMesh,...
                     self.conductivityTransformation, theta_cfOptim);
                 [XoptTemp, fvalTemp] = fminunc(objFun, Xinit, options);
                 LambdaOptTemp = conductivityBackTransform(XoptTemp,...
@@ -837,16 +780,16 @@ classdef ROM_SPDE < handle
                 lowerBoundS*ones(self.fineMesh.nNodes, 1);
 
             if self.free_W
-                self.mean_TcTcT(self.coarseMesh.essentialNodes, :) = [];
-                self.mean_TcTcT(:, self.coarseMesh.essentialNodes) = [];
+                self.mean_ucucT(self.coarseMesh.essentialNodes, :) = [];
+                self.mean_ucucT(:, self.coarseMesh.essentialNodes) = [];
                 if isempty(self.fineMesh.essentialNodes)
                     warning(strcat('No essential nodes stored in', ...
                     ' fineMesh. Setting first node to be essential.'))
                     self.fineMesh.essentialNodes = 1;
                 end
-                self.mean_TfTcT(self.fineMesh.essentialNodes, :) = [];
-                self.mean_TfTcT(:, self.coarseMesh.essentialNodes) = [];
-                W_temp = self.mean_TfTcT/self.mean_TcTcT;
+                self.mean_ufucT(self.fineMesh.essentialNodes, :) = [];
+                self.mean_ufucT(:, self.coarseMesh.essentialNodes) = [];
+                W_temp = self.mean_ufucT/self.mean_ucucT;
                 
                 natNodesFine = 1:self.fineMesh.nNodes;
                 natNodesFine(self.fineMesh.essentialNodes) = [];
@@ -1295,16 +1238,11 @@ classdef ROM_SPDE < handle
             %Load test file
             if strcmp(mode, 'self')
                 %Self-prediction on training set
-                if self.useKernels
-                    error(strcat('Self-prediction using kernel',...
-                        ' regression not yet implemented'))
-                end
-                Tf = self.trainingDataMatfile.Tf(:,...
-                    self.nStart:(self.nStart + self.nTrain - 1));
+                uf = self.trainingDataMatfile.uf(:, self.nStart:(self.nStart + self.nTrain - 1));
                 tempVars = whos(self.trainingDataMatfile);
                 bcVar = ismember('bc', {tempVars.name});
             else
-                Tf = self.testDataMatfile.Tf(:, self.testSamples);
+                uf = self.testDataMatfile.uf(:, self.testSamples);
                 tempVars = whos(self.testDataMatfile);
                 bcVar = ismember('bc', {tempVars.name});
             end
@@ -1381,10 +1319,10 @@ classdef ROM_SPDE < handle
             
             %% Run coarse model and sample from p_cf
             disp('Solving coarse model and sample from p_cf...')
-            TfMeanArray{1} = zeros(self.fineMesh.nNodes, 1);
-            TfMeanArray = repmat(TfMeanArray, nTest, 1);
-            TfVarArray = TfMeanArray;
-            Tf_sq_mean = TfMeanArray;
+            ufMeanArray{1} = zeros(self.fineMesh.nNodes, 1);
+            ufMeanArray = repmat(ufMeanArray, nTest, 1);
+            ufVarArray = ufMeanArray;
+            uf_sq_mean = ufMeanArray;
             
             if(bcVar)
                 %Set coarse domain for data with different boundary conditions
@@ -1428,46 +1366,46 @@ classdef ROM_SPDE < handle
                 end
                 for i = 1:nSamples
                     FEMout = heat2d(coarseDomain, LambdaSamples{j}(:, i));
-                    Tctemp = FEMout.Tff';
+                    uctemp = FEMout.uff';
                     
                     %sample from p_cf
-                    mu_cf = t_cf.mu + t_cf.W*Tctemp(:);
+                    mu_cf = t_cf.mu + t_cf.W*uctemp(:);
                     %only for diagonal S!!
-                    %Sequentially compute mean and <Tf^2> to save memory
+                    %Sequentially compute mean and <uf^2> to save memory
                     %U_f-integration can be done analyt.
-                    TfMeanArray{j} = ((i - 1)/i)*TfMeanArray{j} + (1/i)*mu_cf;
-                    Tf_sq_mean{j} = ((i - 1)/i)*Tf_sq_mean{j} + (1/i)*mu_cf.^2;
+                    ufMeanArray{j} = ((i - 1)/i)*ufMeanArray{j} + (1/i)*mu_cf;
+                    uf_sq_mean{j} = ((i - 1)/i)*uf_sq_mean{j} + (1/i)*mu_cf.^2;
                 end
                 if lapAp
 %                     S = exp(normrnd(log(t_cf.S), stdLogS));
                     S = t_cf.S;
-                    Tf_sq_mean{j} = Tf_sq_mean{j} + S;
+                    uf_sq_mean{j} = uf_sq_mean{j} + S;
                 else
-                    Tf_sq_mean{j} = Tf_sq_mean{j} + t_cf.S;
+                    uf_sq_mean{j} = uf_sq_mean{j} + t_cf.S;
                 end
                 %abs to avoid negative variance due to numerical error
-                Tf_var = abs(Tf_sq_mean{j} - TfMeanArray{j}.^2);
-                meanTf_meanMCErr = mean(sqrt(Tf_var/nSamples))
-                TfVarArray{j} = Tf_var;
+                uf_var = abs(uf_sq_mean{j} - ufMeanArray{j}.^2);
+                meanuf_meanMCErr = mean(sqrt(uf_var/nSamples))
+                ufVarArray{j} = uf_var;
                 
-                meanMahaErrTemp{j} = mean(sqrt(abs((1./(Tf_var)).*(Tf(:, j)...
-                    - TfMeanArray{j}).^2)));
-                sqDist{j} = (Tf(:, j) - TfMeanArray{j}).^2;
+                meanMahaErrTemp{j} = mean(sqrt(abs((1./(uf_var)).*(uf(:, j)...
+                    - ufMeanArray{j}).^2)));
+                sqDist{j} = (uf(:, j) - ufMeanArray{j}).^2;
                 meanSqDistTemp{j} = mean(sqDist{j});
                 
-                Tf_var_nat = Tf_var(natNodes);
+                uf_var_nat = uf_var(natNodes);
                 logLikelihood{j} = -.5*nNatNodes*log(2*pi) -...
-                    .5*sum(log(Tf_var_nat), 'omitnan') - ...
-                    .5*sum(sqDist{j}(natNodes)./Tf_var_nat, 'omitnan');
+                    .5*sum(log(uf_var_nat), 'omitnan') - ...
+                    .5*sum(sqDist{j}(natNodes)./uf_var_nat, 'omitnan');
                 logPerplexity{j} = -(1/(nNatNodes))*logLikelihood{j};
             end
             
-            self.meanPredMeanOutput = mean(cell2mat(TfMeanArray'), 2);
+            self.meanPredMeanOutput = mean(cell2mat(ufMeanArray'), 2);
             self.meanMahalanobisError = mean(cell2mat(meanMahaErrTemp));
             self.meanSquaredDistanceField = mean(cell2mat(sqDist), 2);
             self.meanSquaredDistance = mean(cell2mat(meanSqDistTemp));
             self.squaredDistance = meanSqDistTemp;
-            norm_data = sqrt(sum(Tf.^2));
+            norm_data = sqrt(sum(uf.^2));
             self.normError = cell2mat(meanSqDistTemp)./norm_data;
             meanSqDistSq = mean(cell2mat(meanSqDistTemp).^2);
             self.meanSquaredDistanceError = sqrt((meanSqDistSq -...
@@ -1477,8 +1415,8 @@ classdef ROM_SPDE < handle
             self.meanPerplexity = exp(self.meanLogPerplexity);
             storeArray = false;
             if storeArray
-                self.predMeanArray = TfMeanArray;
-                self.predVarArray = TfVarArray;
+                self.predMeanArray = ufMeanArray;
+                self.predVarArray = ufVarArray;
             end
             
             plotPrediction = true;
@@ -1486,8 +1424,8 @@ classdef ROM_SPDE < handle
                 f = figure('units','normalized','outerposition',[0 0 1 1]);
                 pstart = 1;
                 j = 1;
-                max_Tf = max(max(Tf(:, pstart:(pstart + 5))));
-                min_Tf = min(min(Tf(:, pstart:(pstart + 5))));
+                max_uf = max(max(uf(:, pstart:(pstart + 5))));
+                min_uf = min(min(uf(:, pstart:(pstart + 5))));
                 if strcmp(mode, 'self')
                     cond = self.trainingDataMatfile.cond(:,...
                         self.nStart:(self.nStart + self.nTrain - 1));
@@ -1497,37 +1435,28 @@ classdef ROM_SPDE < handle
                         self.testSamples(1):(self.testSamples(1) + 5));
                 end
                 %to use same color scale
-                cond = ((min_Tf - max_Tf)/(min(min(cond)) -...
-                    max(max(cond))))*cond + max_Tf - ...
-                    ((min_Tf - max_Tf)/(min(min(cond)) -...
-                    max(max(cond))))*max(max(cond));
+                cond = ((min_uf - max_uf)/(min(min(cond)) - max(max(cond))))*cond + max_uf - ...
+                    ((min_uf - max_uf)/(min(min(cond)) - max(max(cond))))*max(max(cond));
                 for i = pstart:(pstart + 5)
                     subplot(2, 3, j)
-                    Tf_i_min = min(Tf(:, i))
-                    s(j, 1) = surf(reshape(Tf(:, i) - Tf_i_min,...
-                        (self.nElFX + 1), (self.nElFY + 1)));
+                    uf_i_min = min(uf(:, i))
+                    s(j, 1) = surf(reshape(uf(:, i) - uf_i_min, (self.nElFX + 1), (self.nElFY + 1)));
                     s(j, 1).LineStyle = 'none';
                     hold on;
-                    s(j, 2) = surf(reshape(TfMeanArray{i} - Tf_i_min,...
-                        (self.nElFX + 1), (self.nElFY + 1)));
+                    s(j, 2) = surf(reshape(ufMeanArray{i} - uf_i_min, (self.nElFX + 1), (self.nElFY + 1)));
                     s(j, 2).LineStyle = 'none';
                     s(j, 2).FaceColor = 'b';
-                    s(j, 3) = surf(reshape(TfMeanArray{i} - Tf_i_min,...
-                        (self.nElFX + 1), (self.nElFY + 1)) +...
-                        sqrt(reshape(TfVarArray{i}, (self.nElFX + 1),...
-                        (self.nElFY + 1))));
+                    s(j, 3) = surf(reshape(ufMeanArray{i} - uf_i_min, (self.nElFX + 1), (self.nElFY + 1)) +...
+                        sqrt(reshape(ufVarArray{i}, (self.nElFX + 1), (self.nElFY + 1))));
                     s(j, 3).LineStyle = 'none';
                     s(j, 3).FaceColor = [.85 .85 .85];
-                    s(j, 4) = surf(reshape(TfMeanArray{i} - Tf_i_min,...
-                        (self.nElFX + 1), (self.nElFY + 1)) -...
-                        sqrt(reshape(TfVarArray{i}, (self.nElFX + 1),...
-                        (self.nElFY + 1))));
+                    s(j, 4) = surf(reshape(ufMeanArray{i} - uf_i_min, (self.nElFX + 1), (self.nElFY + 1)) -...
+                        sqrt(reshape(ufVarArray{i}, (self.nElFX + 1), (self.nElFY + 1))));
                     s(j, 4).LineStyle = 'none';
                     s(j, 4).FaceColor = [.85 .85 .85];
                     ax = gca;
                     ax.FontSize = 30;
-                    im(j) = imagesc(reshape(cond(:, i),...
-                        self.fineMesh.nElX, self.fineMesh.nElY));
+                    im(j) = imagesc(reshape(cond(:, i), self.fineMesh.nElX, self.fineMesh.nElY));
                     xticks([0 64 128 192 256]);
                     yticks([0 64 128 192 256]);
 %                     zticks(100:100:800)
@@ -1538,8 +1467,8 @@ classdef ROM_SPDE < handle
                     axis square;
                     box on;
                     view(-60, 15)
-                    zlim([min_Tf max_Tf]);
-                    caxis([min_Tf max_Tf]);
+                    zlim([min_uf max_uf]);
+                    caxis([min_uf max_uf]);
                     j = j + 1;
                 end
 %                 print(f, './predictions', '-dpng', '-r300')
@@ -1566,14 +1495,11 @@ classdef ROM_SPDE < handle
             %Load test file
             if strcmp(mode, 'self')
                 %Self-prediction on training set
-                assert(~self.useKernels,...
-                  'Self-prediction using kernel regression not yet implemented')
-                Tf = self.trainingDataMatfile.Tf(:, ...
-                    self.nStart:(self.nStart + self.nTrain - 1));
+                uf = self.trainingDataMatfile.uf(:, self.nStart:(self.nStart + self.nTrain - 1));
                 tempVars = whos(self.trainingDataMatfile);
                 bcVar = ismember('bc', {tempVars.name});
             else
-                Tf = self.testDataMatfile.Tf(:, self.testSamples);
+                uf = self.testDataMatfile.uf(:, self.testSamples);
                 tempVars = whos(self.testDataMatfile);
                 bcVar = ismember('bc', {tempVars.name});
             end
@@ -1633,10 +1559,10 @@ classdef ROM_SPDE < handle
             
             %% Run coarse model and sample from p_cf
             disp('Solving coarse model and sample from p_cf...')
-            TfMean{1} = zeros(self.fineMesh.nNodes, nTest);
-            TfMean = repmat(TfMean, nSamplesTheta, 1);
-            TfVar = TfMean;
-            Tf_sq_mean = TfMean;
+            ufMean{1} = zeros(self.fineMesh.nNodes, nTest);
+            ufMean = repmat(ufMean, nSamplesTheta, 1);
+            ufVar = ufMean;
+            uf_sq_mean = ufMean;
             
             if(bcVar)
                 %Set coarse domain for data with different boundary conditions
@@ -1683,25 +1609,25 @@ classdef ROM_SPDE < handle
                         end
                         
                         FEMout= heat2d(coarseDomain, LambdaSamples{n, t}(:, i));
-                        Tctemp = FEMout.Tff';
+                        uctemp = FEMout.uff';
                         
                         %sample from p_cf
-                        mu_cf = t_cf.mu + t_cf.W*Tctemp(:);
+                        mu_cf = t_cf.mu + t_cf.W*uctemp(:);
                         %only for diagonal S!!
-                        %Sequentially compute mean and <Tf^2> to save memory
+                        %Sequentially compute mean and <uf^2> to save memory
                         %U_f-integration can be done analyt.
-                        TfMean{t}(:, n) =...
-                            ((i - 1)/i)*TfMean{t}(:, n) + (1/i)*mu_cf;
-                        Tf_sq_mean{t}(:, n) =...
-                            ((i - 1)/i)*Tf_sq_mean{t}(:, n) + (1/i)*mu_cf.^2;
+                        ufMean{t}(:, n) =...
+                            ((i - 1)/i)*ufMean{t}(:, n) + (1/i)*mu_cf;
+                        uf_sq_mean{t}(:, n) =...
+                            ((i - 1)/i)*uf_sq_mean{t}(:, n) + (1/i)*mu_cf.^2;
                     end
                     
-                    Tf_sq_mean{t}(:, n) = Tf_sq_mean{t}(:, n) + t_cf.S;
+                    uf_sq_mean{t}(:, n) = uf_sq_mean{t}(:, n) + t_cf.S;
                 end
-                predMean{t} = mean(TfMean{t}, 2);
-                predSqMean{t} = mean(Tf_sq_mean{t}, 2);
-                TfMean{t} = []; %save memory
-                Tf_sq_mean{t} = [];
+                predMean{t} = mean(ufMean{t}, 2);
+                predSqMean{t} = mean(uf_sq_mean{t}, 2);
+                ufMean{t} = []; %save memory
+                uf_sq_mean{t} = [];
             end
             
 
@@ -1737,8 +1663,7 @@ classdef ROM_SPDE < handle
             end
         end
 
-        function [lambdak, xk] =...
-                get_coarseElementConductivities(self, mode, samples)
+        function [lambdak, xk] = get_coarseElementConductivities(self, mode, samples)
             %Cuts out conductivity fields from macro-cells
 			addpath('./rom');            
 
@@ -1800,76 +1725,6 @@ classdef ROM_SPDE < handle
             end
         end
         
-        function computeKernelMatrix(self, mode)
-            %To be called BEFORE set. up loc. mode (useLocal, useNeighbor,...)
-            disp('Using kernel regression mode.')
-            
-            %check if coarse mesh is square
-            if(all(self.coarseGridVectorX == self.coarseGridVectorX(1)) &&...
-                    all(self.coarseGridVectorY == self.coarseGridVectorX(1)))
-                %Coarse model is a square grid
-                isSquare = true;
-            else
-                isSquare = false;
-            end
-            
-            if isSquare
-                %We take all kernels together from all macro-cells
-                %prealloc
-                self.kernelMatrix{1} = zeros(self.coarseMesh.nEl,...
-                    self.coarseMesh.nEl*self.nTrain);
-                self.kernelMatrix = repmat(self.kernelMatrix, self.nTrain, 1);
-                
-                %Fill kernelMatrix - can this be done more efficiently?
-                if strcmp(mode, 'train')
-                    for n = 1:self.nTrain
-                        for k = 1:self.coarseMesh.nEl
-                            f = 1;
-                            for nn = 1:self.nTrain
-                                for kk = 1:self.coarseMesh.nEl
-                                    %kernelDiff is a row vector
-                                    kernelDiff = self.designMatrix{n}(k, :) -...
-                                        self.designMatrix{nn}(kk, :);
-                                    self.kernelMatrix{n}(k, f) =...
-                                        self.kernelFunction(kernelDiff);
-                                    f = f + 1;
-                                end
-                            end
-                        end
-                    end
-                elseif strcmp(mode, 'test')
-                    disp(strcat('Computing kernel matrix in test mode.',...
-                        ' Make sure to load correct training design matrix!'))
-                    load('./persistentData/trainDesignMatrix.mat');
-                    for n = 1:numel(self.designMatrix)
-                        for k = 1:self.coarseMesh.nEl
-                            f = 1;
-                            for nn = 1:self.nTrain
-                                for kk = 1:self.coarseMesh.nEl
-                                    %kernelDiff is a row vector
-                                    kernelDiff = self.designMatrix{n}(k, :) -...
-                                        designMatrix{nn}(kk, :);
-                                    self.kernelMatrix{n}(k, f) =...
-                                        self.kernelFunction(kernelDiff);
-                                    f = f + 1;
-                                end
-                            end
-                        end
-                    end
-                else
-                    error('Use either train or test mode')
-                end
-            else
-                error('Non-square meshes not yet available')
-            end
-            if(strcmp(mode, 'train') && length(self.theta_c.theta) ~=...
-                    self.coarseMesh.nEl*self.nTrain)
-                disp('Setting dimension of theta_c right, initializing at 0')
-                self.theta_c.theta =...
-                    zeros(self.coarseMesh.nEl*self.nTrain, 1);
-            end
-        end
-
         function computeDesignMatrix(self, mode, recompute)
             %Actual computation of design matrix
             %set recompute to true if design matrices have 
@@ -2073,75 +1928,25 @@ classdef ROM_SPDE < handle
                 if(any(any(self.secondOrderTerms)))
                     self = self.secondOrderFeatures(mode);
                 end
-                if(self.useKernels)
-                    if(strcmp(self.bandwidthSelection, 'scott') ||...
-                            strcmp(self.bandwidthSelection, 'silverman'))
-                        %Compute feature function variances
-                        if strcmp(mode, 'train')
-                            if isempty(self.featureFunctionMean)
-                                self = self.computeFeatureFunctionMean;
-                            end
-                            if isempty(self.featureFunctionSqMean)
-                                self.computeFeatureFunctionSqMean;
-                            end
-                            featureFunctionStd =...
-                                sqrt(self.featureFunctionSqMean -...
-                                self.featureFunctionMean.^2);
-                            nFeatures = numel(self.featureFunctionMean);
-                            %Scott's rule of thumb
-                            if strcmp(self.mode, 'none')
-                                self.kernelBandwidth =...
-                                    (self.nTrain*self.coarseMesh.nEl)...
-                                    ^(-1/(nFeatures + 4))*featureFunctionStd;
-                            elseif strcmp(self.mode, 'useLocal')
-                                self.kernelBandwidth = ...
-                                    self.nTrain^(-1/(nFeatures + 4))*...
-                                    featureFunctionStd;
-                            else
-                                error('No rule of thumb impl. for this mode')
-                            end
-                            if strcmp(self.bandwidthSelection, 'silverman')
-                                self.kernelBandwidth = self.kernelBandwidth*...
-                                    (4/(nFeatures + 2))^(1/(nFeatures + 4));
-                            end
-                            kernelBandwidth = self.kernelBandwidth;
-                            save('./persistentData/kernelBandwidth.mat',...
-                                'kernelBandwidth');
-                        elseif strcmp(mode, 'test')
-                            load('./persistentData/kernelBandwidth.mat');
-                            self.kernelBandwidth = kernelBandwidth;
-                        else
-                            error('Choose test or train mode!')
-                        end                        
-                    elseif strcmp(self.bandwidthSelection, 'fixed')
-                        %change nothing
-                    else
-                        error('Invalid bandwidth selection')
-                    end
-                    self.computeKernelMatrix(mode);
-                    
+                if strcmp(mode, 'train')
+                    PhiCell = self.designMatrix;
+                elseif strcmp(mode, 'test')
+                    PhiCell = self.testDesignMatrix;
                 else
-                    if strcmp(mode, 'train')
-                        PhiCell = self.designMatrix;
-                    elseif strcmp(mode, 'test')
-                        PhiCell = self.testDesignMatrix;
-                    else
-                        error('Wrong design matrix computation model')
-                    end
-                    %Normalize design matrices. Do not do this using kernels!
-                    %Kernel bandwidth is adjusted instead!
-                    if strcmp(self.featureScaling, 'standardize')
-                        self.standardizeDesignMatrix(mode, PhiCell);
-                    elseif strcmp(self.featureScaling, 'rescale')
-                        self.rescaleDesignMatrix(mode, PhiCell);
-                    elseif strcmp(self.featureScaling, 'normalize')
-                        self.normalizeDesignMatrix(mode, PhiCell);
-                    else
-                        disp('No feature scaling used...')
-                    end
+                    error('Wrong design matrix computation model')
+                end
+                %Normalize design matrices
+                if strcmp(self.featureScaling, 'standardize')
+                    self.standardizeDesignMatrix(mode, PhiCell);
+                elseif strcmp(self.featureScaling, 'rescale')
+                    self.rescaleDesignMatrix(mode, PhiCell);
+                elseif strcmp(self.featureScaling, 'normalize')
+                    self.normalizeDesignMatrix(mode, PhiCell);
+                else
+                    disp('No feature scaling used...')
                 end
                 
-                %Design matrix is always stored in its original form. 
+                %Design matrix is always stored in its original form.
                 %Local modes are applied after loading
                 if strcmp(mode, 'train')
                     designMatrix = self.designMatrix;
@@ -2150,19 +1955,8 @@ classdef ROM_SPDE < handle
                         'DesignMatrix.mat'), 'designMatrix')
                 end
             end
-            if self.useKernels
-                %This step might be confusing: after storing, we replace the 
-                %design matrix by the kernel matrix
-                if strcmp(mode, 'train')
-                    self.designMatrix = self.kernelMatrix;
-                elseif strcmp(mode, 'test')
-                    self.testDesignMatrix = self.kernelMatrix;
-                else
-                    error('wrong mode')
-                end
-                PhiCell = self.kernelMatrix;
-                self.kernelMatrix = [];  %to save memory
-            end
+
+            
             %Use specific nonlocality mode
             if strcmp(self.mode, 'useNeighbor')
                 %use feature function information from nearest neighbors
@@ -2985,18 +2779,7 @@ classdef ROM_SPDE < handle
             end
         end
         
-        function k = kernelFunction(self, kernelDiff)
-            %kernelDiff is the difference of the dependent 
-            %variable to the kernel center
-            tau = diag(1./(2*self.kernelBandwidth.^2));
-            if strcmp(self.kernelType, 'squaredExponential')
-                k = exp(- kernelDiff*tau*kernelDiff');
-            else
-                error('Unknown kernel type')
-            end
-        end
 
-        
         
         %% plot functions
         function p = plotTrainingInput(self, samples, titl)
@@ -3038,15 +2821,15 @@ classdef ROM_SPDE < handle
         function [p, im] = plotTrainingOutput(self, samples, titl)
             %Load microstructures
             samplesTemp = min(samples):max(samples);
-            Tf = self.trainingDataMatfile.Tf(:, samplesTemp);
+            uf = self.trainingDataMatfile.uf(:, samplesTemp);
             cond = self.trainingDataMatfile.cond(:, samplesTemp);
             samples = samples - min(samples) + 1;
-            min_Tf = min(min(Tf(:, samples)));
-            max_Tf = max(max(Tf(:, samples)));
+            min_uf = min(min(uf(:, samples)));
+            max_uf = max(max(uf(:, samples)));
             %to use same color scale
-            cond = ((min_Tf - max_Tf)/(min(min(cond)) -...
-                max(max(cond))))*cond + max_Tf - ...
-                ((min_Tf - max_Tf)/(min(min(cond)) -...
+            cond = ((min_uf - max_uf)/(min(min(cond)) -...
+                max(max(cond))))*cond + max_uf - ...
+                ((min_uf - max_uf)/(min(min(cond)) -...
                 max(max(cond))))*max(max(cond));
             f1 = figure;
             f2 = figure;
@@ -3056,10 +2839,10 @@ classdef ROM_SPDE < handle
             for i = 1:12
                 figure(f1)
                 subplot(4, 3, i);
-                p(i) = surf(reshape(Tf(:, samples(i)),...
+                p(i) = surf(reshape(uf(:, samples(i)),...
                     (self.fineMesh.nElX + 1),...
                     (self.fineMesh.nElY + 1)));
-                caxis([min_Tf, max_Tf])
+                caxis([min_uf, max_uf])
                 hold
                 im(i) = imagesc(reshape(cond(:, samples(i)),...
                     self.fineMesh.nElX, self.fineMesh.nElY));
@@ -3068,7 +2851,7 @@ classdef ROM_SPDE < handle
                 axis tight;
                 box on;
                 axis square;
-                zlim([min_Tf, max_Tf])
+                zlim([min_uf, max_uf])
 %                 xlabel('x')
 %                 ylabel('y')
                 zl = zlabel('$y(\vec{x})$');
@@ -3093,10 +2876,10 @@ classdef ROM_SPDE < handle
 
                 figure(f2)
                 subplot(4, 3, i);
-                [~,p2(i)] = contourf(reshape(Tf(:, samples(i)),...
+                [~,p2(i)] = contourf(reshape(uf(:, samples(i)),...
                     (self.fineMesh.nElX + 1),...
                     (self.fineMesh.nElY + 1)), 8);
-                caxis([min_Tf, max_Tf])
+                caxis([min_uf, max_uf])
                 grid off;
                 p2(i).LineStyle = 'none';
                 xticks({});
@@ -3117,7 +2900,7 @@ classdef ROM_SPDE < handle
                     xticks({});
                     yticks({});
                     subplot(1,2,2)
-                    q(i) = surf(reshape(Tf(:, samples(i)),...
+                    q(i) = surf(reshape(uf(:, samples(i)),...
                         (self.fineMesh.nElX + 1),...
                         (self.fineMesh.nElY + 1)));
                     q(i).LineStyle = 'none';
@@ -3150,26 +2933,10 @@ classdef ROM_SPDE < handle
 
             iter = 1;
             for feature = features
-                if(~(self.useKernels && totalFeatures ~= 1) || iter == 1)
+                if(~(totalFeatures ~= 1) || iter == 1)
                     f = figure;
                 end
-                if self.useKernels
-%                     if size(obj.globalFeatureFunctions, 2)
-%                         error('Not yet generalized for global features')
-%                     end
-                    load(strcat('./persistentData/', 'train',...
-                        'DesignMatrix.mat'), 'designMatrix');
-                    %Setting up handles to kernel functions
-                    for k = 1:self.coarseMesh.nEl
-                        for n = 1:self.nTrain
-                            %phi_vec must be a row vector!!
-                            kernelDiff{n, k} =...
-                                @(phi_vec) phi_vec - designMatrix{n}(k, :);
-                            kernelHandle{n, k} = @(phi_vec)...
-                                self.kernelFunction(kernelDiff{n, k}(phi_vec));
-                        end
-                    end
-                end
+
                 k = 1;
                 if strcmp(self.mode, 'useLocal')
                     mink = Inf*ones(self.coarseMesh.nEl, 1);
@@ -3206,150 +2973,47 @@ classdef ROM_SPDE < handle
                             x = linspace(mink(k), maxk(k), 100);
                             y = 0*x;
                             
-                            if self.useKernels
-                                if(size(self.featureFunctions, 2) + ...
-                                       size(self.globalFeatureFunctions, 2)== 1)
-                                    for m = 1:length(x)
-                                        for n = 1:self.nTrain
-                                            y(m) = y(m) + ...
-                                                kernelHandle{n, k}(x(m))*...
-                                                self.theta_c.theta((n - 1)*...
-                                                self.coarseMesh.nEl + k);
-                                        end
-                                    end
-                                    plot(x, y);
-                                    axis tight;
-                                    axis square;
-                                    xl = xlabel(...
-                                        'Feature function output $\phi_i$');
-                                    xl.Interpreter = 'latex';
-                                    yl = ylabel(...
-                                        '$<X_k>-\sum_{j\neq i}\theta_j\phi_j$');
-                                    yl.Interpreter = 'latex';
-                                    k = k + 1;
-                                else
-                                    error('Not yet generalized for > 1 feature')
-                                end
+                            useOffset = false;
+                            if useOffset
+                                %it is important that the offset feature
+                                %phi(lambda) = 1 is the very first feature
+                                y = self.theta_c.theta(...
+                                    totalFeatures*(k - 1) + 1) +...
+                                    self.theta_c.theta(totalFeatures*...
+                                    (k - 1) + feature)*x;
                             else
-                                useOffset = false;
-                                if useOffset
-                                    %it is important that the offset feature 
-                                    %phi(lambda) = 1 is the very first feature
-                                    y = self.theta_c.theta(...
-                                        totalFeatures*(k - 1) + 1) +...
-                                        self.theta_c.theta(totalFeatures*...
-                                        (k - 1) + feature)*x;
-                                else
-                                    y = self.theta_c.theta(totalFeatures*...
-                                        (k - 1) + feature)*x;
-                                end
-                                plot(x, y);
-                                axis tight;
-                                axis square;
-                                xl = xlabel('Feature function output $\phi_i$');
-                                xl.Interpreter = 'latex';
-                                yl = ylabel(...
-                                    '$<X_k> - \sum_{j\neq i} \theta_j \phi_j$');
-                                yl.Interpreter = 'latex';
-                                k = k + 1;
+                                y = self.theta_c.theta(totalFeatures*...
+                                    (k - 1) + feature)*x;
                             end
+                            plot(x, y);
+                            axis tight;
+                            axis square;
+                            xl = xlabel('Feature function output $\phi_i$');
+                            xl.Interpreter = 'latex';
+                            yl = ylabel(...
+                                '$<X_k> - \sum_{j\neq i} \theta_j \phi_j$');
+                            yl.Interpreter = 'latex';
+                            k = k + 1;
                         end
                     end
                 elseif strcmp(self.mode, 'none')
                     for i = 1:self.coarseMesh.nElX
                         for j = 1:self.coarseMesh.nElY
                             for s = 1:self.nTrain
-                                if self.useKernels
-                                    if(totalFeatures == 1)
-                                        plot(designMatrix{s}(k, feature),...
-                                            self.XMean(k, s), 'xb')
-                                    else
-                                        if(feature == 1)
-                                            plot3(designMatrix{s}(k, 1),...
-                                                designMatrix{s}(k, 2),...
-                                                self.XMean(k, s),...
-                                                'xb', 'linewidth', 2)
-                                        end
-                                    end
-                                else
-                                    plot(self.designMatrix{s}(k, feature),...
-                                        self.XMean(k, s), 'xb')
-                                end
+                                plot(self.designMatrix{s}(k, feature),...
+                                    self.XMean(k, s), 'xb')
                                 hold on;
                             end
                             k = k + 1;
                         end
                     end
-                    if self.useKernels
-                        if(totalFeatures == 1)
-                            x = linspace(min(min(cell2mat(designMatrix))),...
-                                max(max(cell2mat(designMatrix))), 100);
-                            y = 0*x;
-                        else
-                            designMatrixArray = cell2mat(designMatrix');
-                            %Maxima and minima of first and second feature
-                            max1 = max(max(designMatrixArray(:,...
-                                1:totalFeatures:end)));
-                            max2 = max(max(designMatrixArray(:,...
-                                2:totalFeatures:end)));
-                            min1 = min(min(designMatrixArray(:,...
-                                1:totalFeatures:end)));
-                            min2 = min(min(designMatrixArray(:,...
-                                2:totalFeatures:end)));
-                            [X, Y] = meshgrid(linspace(min1, max1, 30),...
-                                linspace(min2, max2, 30));
-                        end
-                    else
-                        x = linspace(min(min(cell2mat(self.designMatrix))),...
-                            max(max(cell2mat(self.designMatrix))), 100);
-                        y = 0*x;
-                    end
-                    if self.useKernels
-                        if(totalFeatures == 1)
-                            for m = 1:length(x)
-                                for n = 1:self.nTrain
-                                    for h = 1:self.coarseMesh.nEl
-                                        y(m) = y(m)+kernelHandle{n, h}(x(m))*...
-                                            self.theta_c.theta((n - 1)*...
-                                            self.coarseMesh.nEl + h);
-                                    end
-                                end
-                            end
-                            plot(x, y);
-                            axis tight;
-                        else
-                            if(feature == 1)
-                                %Plot first two features as surface
-                                Z = 0*X;  %prealloc
-                                for c = 1:size(Z, 2)
-                                    for r = 1:size(Z, 1)
-                                        %Projection onto the first two features
-                                        phi_vec = ...
-                                            zeros(1, size(designMatrix{1}, 2));
-                                        phi_vec(1:2) = [X(r, c) Y(r, c)];
-                                        for n = 1:self.nTrain
-                                            for h = 1:self.coarseMesh.nEl
-                                                Z(r, c) = Z(r, c) + ...
-                                                   kernelHandle{n, h}...
-                                                   (phi_vec)*...
-                                                   self.theta_c.theta((n-1)*...
-                                                   self.coarseMesh.nEl...
-                                                   + h);
-                                            end
-                                        end
-                                    end
-                                end
-                                surf(X, Y, Z)
-                                axis square;
-                                axis tight;
-                                box on;
-                            end
-                        end
-                    else
-                        y = self.theta_c.theta(feature)*x;
-                        plot(x, y);
-                        axis tight;
-                    end
+                    
+                    x = linspace(min(min(cell2mat(self.designMatrix))),...
+                        max(max(cell2mat(self.designMatrix))), 100);
+                    y = 0*x;
+                    y = self.theta_c.theta(feature)*x;
+                    plot(x, y);
+                    axis tight;
                 end
                 iter = iter + 1;
             end
@@ -3439,16 +3103,12 @@ classdef ROM_SPDE < handle
             %Plots the current modal effective property and the modal
             %reconstruction for 2 -training- samples
             %load finescale conductivity field
-            conductivity = self.trainingDataMatfile.cond(:,...
-                (self.nStart + dataOffset):(self.nStart + dataOffset + 3));
+            conductivity = self.trainingDataMatfile.cond(:, (self.nStart + dataOffset):(self.nStart + dataOffset + 3));
             for i = 1:4
-                Lambda_eff_mode = conductivityBackTransform(...
-                    self.designMatrix{i + dataOffset}*self.theta_c.theta,...
+                Lambda_eff_mode = conductivityBackTransform(self.designMatrix{i + dataOffset}*self.theta_c.theta,...
                     self.conductivityTransformation);
                 sb1 = subplot(4, 3, 1 + (i - 1)*3, 'Parent', fig);
-                imagesc(reshape(Lambda_eff_mode,...
-                    self.coarseMesh.nElX,...
-                    self.coarseMesh.nElY)', 'Parent', sb1)
+                imagesc(reshape(Lambda_eff_mode, self.coarseMesh.nElX, self.coarseMesh.nElY), 'Parent', sb1)
                 sb1.YDir = 'normal';
                 axis(sb1, 'tight');
                 axis(sb1, 'square');
@@ -3461,8 +3121,8 @@ classdef ROM_SPDE < handle
                 ny = self.nElFY + 1;
                 XX = meshgrid(linspace(0, 1, nx));
                 [~, YY] = meshgrid(linspace(0, 1, ny));
-                conductivityHandle = imagesc(reshape(conductivity(:, i),...
-                    self.nElFX, self.nElFY), 'Parent', sb2);
+                conductivityHandle = imagesc(reshape(conductivity(:, i), self.nElFX, self.nElFY), 'Parent', sb2);
+                sb2.YDir = 'normal';
                 sb2.GridLineStyle = 'none';
                 sb2.XTick = [];
                 sb2.YTick = [];
@@ -3482,17 +3142,16 @@ classdef ROM_SPDE < handle
                     coarseFEMout = heat2d(self.coarseMesh, D);
                 end
                 
-                Tc = coarseFEMout.u;
+                uc = coarseFEMout.u;
                 nxc = self.coarseMesh.nElX + 1;
                 nyc = self.coarseMesh.nElY + 1;
                 XXc = meshgrid(linspace(0, 1, self.coarseMesh.nElX + 1));
                 [~, YYc] = meshgrid(linspace(0, 1, self.coarseMesh.nElY + 1));
-                reconstructionHandle = surf(XXc, YYc, reshape(Tc, nxc, nyc), 'Parent', sb3);
+                reconstructionHandle = surf(XXc, YYc, reshape(uc, nxc, nyc), 'Parent', sb3);
                 reconstructionHandle.LineStyle = 'none';
                 reconstructionHandle.FaceColor = 'b';
                 hold(sb3, 'on');
-                fineDataHandle2 = surf(XX, YY, ...
-                    reshape(self.fineScaleDataOutput(:, i + dataOffset),...
+                fineDataHandle2 = surf(XX, YY, reshape(self.fineScaleDataOutput(:, i + dataOffset),...
                     nx, ny), 'Parent', sb3);
                 fineDataHandle2.LineStyle = 'none';
                 hold(sb3, 'off');
@@ -3688,8 +3347,7 @@ classdef ROM_SPDE < handle
             %Script to sample d_log_p_cf under p_c to find where 
             %to refine mesh next
 
-            Tf = self.trainingDataMatfile.Tf(:,...
-                self.nStart:(self.nStart + self.nTrain - 1));
+            uf = self.trainingDataMatfile.uf(:, self.nStart:(self.nStart + self.nTrain - 1));
             
             self.loadTrainedParams;
             theta_cfTemp = self.theta_cf;
@@ -3727,25 +3385,17 @@ classdef ROM_SPDE < handle
                 XsampleSqMean = ((i - 1)/i)*XsampleSqMean + (1/i)*mu_i.^2;
                 for j = 1:nSamples
                     Xsample = mvnrnd(mu_i, self.theta_c.Sigma)';
-                    conductivity = conductivityBackTransform(Xsample,...
-                        self.conductivityTransformation);
-                    [lg_p_cf, d_log_p_cf] = log_p_cf(Tf(:, i),...
-                        self.coarseMesh, conductivity,...
+                    conductivity = conductivityBackTransform(Xsample, self.conductivityTransformation);
+                    [lg_p_cf, d_log_p_cf] = log_p_cf(uf(:, i), self.coarseMesh, conductivity,...
                         theta_cfTemp, self.conductivityTransformation);
-                    d_log_p_cf_mean = ((k - 1)/k)*d_log_p_cf_mean +...
-                        (1/k)*d_log_p_cf;
-                    d_log_p_cf_sqMean = ((k - 1)/k)*d_log_p_cf_sqMean +...
-                        (1/k)*d_log_p_cf.^2;
+                    d_log_p_cf_mean = ((k - 1)/k)*d_log_p_cf_mean + (1/k)*d_log_p_cf;
+                    d_log_p_cf_sqMean = ((k - 1)/k)*d_log_p_cf_sqMean + (1/k)*d_log_p_cf.^2;
                     log_p_cf_mean = ((k - 1)/k)*log_p_cf_mean + (1/k)*lg_p_cf;
-                    log_p_cfSqMean = ((k - 1)/k)*log_p_cfSqMean +...
-                        (1/k)*lg_p_cf^2;
+                    log_p_cfSqMean = ((k - 1)/k)*log_p_cfSqMean + (1/k)*lg_p_cf^2;
                     p_cfMean = ((k - 1)/k)*p_cfMean + (1/k)*exp(lg_p_cf);
-                    p_cfSqMean = ((k - 1)/k)*p_cfSqMean + (1/k)*...
-                        exp(2*lg_p_cf);
-                    Xlog_p_cf_mean = ((k - 1)/k)*Xlog_p_cf_mean +...
-                        (1/k)*Xsample*lg_p_cf;
-                    Xp_cfMean = ((k - 1)/k)*Xp_cfMean +...
-                        (1/k)*Xsample*exp(lg_p_cf);
+                    p_cfSqMean = ((k - 1)/k)*p_cfSqMean + (1/k)*exp(2*lg_p_cf);
+                    Xlog_p_cf_mean = ((k - 1)/k)*Xlog_p_cf_mean + (1/k)*Xsample*lg_p_cf;
+                    Xp_cfMean = ((k - 1)/k)*Xp_cfMean + (1/k)*Xsample*exp(lg_p_cf);
                     k = k + 1;
                 end
             end
@@ -3769,28 +3419,18 @@ classdef ROM_SPDE < handle
             
             disp('Sum of grad squares in x-direction:')
             for i = 1:self.coarseMesh.nElY
-                X(i) = sum(d_log_p_cf_sqMean(((i - 1)*...
-                    self.coarseMesh.nElX + 1):...
-                    (i*self.coarseMesh.nElX)));
-                corrX(i) = sum(abs(corrX_log_p_cf(((i - 1)*...
-                    self.coarseMesh.nElX + 1):...
-                    (i*self.coarseMesh.nElX))));
-                corrpcfX(i) = sum((corrXp_cf(((i - 1)*...
-                    self.coarseMesh.nElX + 1):...
-                    (i*self.coarseMesh.nElX))).^2);
+                X(i) = sum(d_log_p_cf_sqMean(((i - 1)*self.coarseMesh.nElX + 1):(i*self.coarseMesh.nElX)));
+                corrX(i) = sum(abs(corrX_log_p_cf(((i - 1)*self.coarseMesh.nElX + 1):(i*self.coarseMesh.nElX))));
+                corrpcfX(i) = sum((corrXp_cf(((i - 1)*self.coarseMesh.nElX + 1):(i*self.coarseMesh.nElX))).^2);
             end
             
             disp('Sum of grad squares in y-direction:')
             for i = 1:self.coarseMesh.nElX
-                Y(i) = sum(d_log_p_cf_sqMean(i:self.coarseMesh.nElX:...
-                    ((self.coarseMesh.nElY - 1)*...
+                Y(i) = sum(d_log_p_cf_sqMean(i:self.coarseMesh.nElX:((self.coarseMesh.nElY - 1)*...
                     self.coarseMesh.nElX + i)));
-                corrY(i) = sum(abs(corrX_log_p_cf(i:...
-                    self.coarseMesh.nElX:...
-                    ((self.coarseMesh.nElY - 1)*...
+                corrY(i) = sum(abs(corrX_log_p_cf(i:self.coarseMesh.nElX:((self.coarseMesh.nElY - 1)*...
                     self.coarseMesh.nElX + i))));
-                corrpcfY(i) = sum((corrXp_cf(i:self.coarseMesh.nElX:...
-                    ((self.coarseMesh.nElY - 1)*...
+                corrpcfY(i) = sum((corrXp_cf(i:self.coarseMesh.nElX:((self.coarseMesh.nElY - 1)*...
                     self.coarseMesh.nElX + i))).^2);
             end
         end
@@ -3926,58 +3566,58 @@ classdef ROM_SPDE < handle
                 phi{k, nFeatures + 1} = @(lambda) 1;
                 nFeatures = nFeatures + 1;
 %                 
-                phi{k, nFeatures + 1} = @(lambda)...
-                    SCA(lambda, conductivities, ct);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    maxwellGarnett(lambda, conductivities, ct, 'lo');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    maxwellGarnett(lambda, conductivities, ct, 'hi');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    differentialEffectiveMedium(lambda, conductivities,ct,'lo');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    differentialEffectiveMedium(lambda, conductivities,ct,'hi');
-                nFeatures = nFeatures + 1;
-                
-                phi{k, nFeatures + 1} = @(lambda)...
-                    log(linealPath(lambda, 4, 'x', 2, conductivities) +...
-                    linealPath(lambda, 4, 'y', 2, conductivities) + 1/4096);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    log(linealPath(lambda, 4, 'x', 1, conductivities) +...
-                    linealPath(lambda, 4, 'y', 1, conductivities) + 1/4096);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    log(linealPath(lambda, 7, 'x', 2, conductivities) +...
-                    linealPath(lambda, 7, 'y', 2, conductivities) + 1/4096);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    log(linealPath(lambda, 7, 'x', 1, conductivities) +...
-                    linealPath(lambda, 7, 'y', 1, conductivities) + 1/4096);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    log(linealPath(lambda, 10, 'x', 2, conductivities) +...
-                    linealPath(lambda, 10, 'y', 2, conductivities) + 1/4096);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    log(linealPath(lambda, 10, 'x', 1, conductivities) +...
-                    linealPath(lambda, 10, 'y', 1, conductivities) + 1/4096);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
-                    (2:2:8)', conductivities, 1, 'a');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
-                    (2:2:8)', conductivities, 1, 'b');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
-                    (2:2:8)', conductivities, 2, 'a');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
-                    (2:2:8)', conductivities, 2, 'b');
-                nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     SCA(lambda, conductivities, ct);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     maxwellGarnett(lambda, conductivities, ct, 'lo');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     maxwellGarnett(lambda, conductivities, ct, 'hi');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     differentialEffectiveMedium(lambda, conductivities,ct,'lo');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     differentialEffectiveMedium(lambda, conductivities,ct,'hi');
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     log(linealPath(lambda, 4, 'x', 2, conductivities) +...
+%                     linealPath(lambda, 4, 'y', 2, conductivities) + 1/4096);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     log(linealPath(lambda, 4, 'x', 1, conductivities) +...
+%                     linealPath(lambda, 4, 'y', 1, conductivities) + 1/4096);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     log(linealPath(lambda, 7, 'x', 2, conductivities) +...
+%                     linealPath(lambda, 7, 'y', 2, conductivities) + 1/4096);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     log(linealPath(lambda, 7, 'x', 1, conductivities) +...
+%                     linealPath(lambda, 7, 'y', 1, conductivities) + 1/4096);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     log(linealPath(lambda, 10, 'x', 2, conductivities) +...
+%                     linealPath(lambda, 10, 'y', 2, conductivities) + 1/4096);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     log(linealPath(lambda, 10, 'x', 1, conductivities) +...
+%                     linealPath(lambda, 10, 'y', 1, conductivities) + 1/4096);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
+%                     (2:2:8)', conductivities, 1, 'a');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
+%                     (2:2:8)', conductivities, 1, 'b');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
+%                     (2:2:8)', conductivities, 2, 'a');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
+%                     (2:2:8)', conductivities, 2, 'b');
+%                 nFeatures = nFeatures + 1;
 %                 phi{k, nFeatures + 1} = @(lambda)...
 %                     linealPath(lambda, 3, 'y', 2, conductivities);
 %                 nFeatures = nFeatures + 1;
@@ -3994,36 +3634,36 @@ classdef ROM_SPDE < handle
 % %                     linealPath(lambda, 6, 'y', 1, conductivities);
 % %                 nFeatures = nFeatures + 1;
 % % 
-                phi{k, nFeatures + 1} = @(lambda)...
-                    numberOfObjects(lambda, conductivities, 'hi');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    numberOfObjects(lambda, conductivities, 'lo');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    nPixelCross(lambda, 'y', 1, conductivities, 'max');
-				nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    nPixelCross(lambda, 'x', 1, conductivities, 'max');
-				nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    nPixelCross(lambda, 'y', 2, conductivities, 'max');
-				nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    nPixelCross(lambda, 'x', 2, conductivities, 'max');
-				nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    maxExtent(lambda, conductivities, 'hi', 'y');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    maxExtent(lambda, conductivities, 'hi', 'x');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    maxExtent(lambda, conductivities, 'lo', 'y');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    maxExtent(lambda, conductivities, 'lo', 'x');
-                nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     numberOfObjects(lambda, conductivities, 'hi');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     numberOfObjects(lambda, conductivities, 'lo');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     nPixelCross(lambda, 'y', 1, conductivities, 'max');
+% 				nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     nPixelCross(lambda, 'x', 1, conductivities, 'max');
+% 				nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     nPixelCross(lambda, 'y', 2, conductivities, 'max');
+% 				nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     nPixelCross(lambda, 'x', 2, conductivities, 'max');
+% 				nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     maxExtent(lambda, conductivities, 'hi', 'y');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     maxExtent(lambda, conductivities, 'hi', 'x');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     maxExtent(lambda, conductivities, 'lo', 'y');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     maxExtent(lambda, conductivities, 'lo', 'x');
+%                 nFeatures = nFeatures + 1;
                 
 
                 phi{k, nFeatures + 1} = @(lambda)...
@@ -4042,46 +3682,46 @@ classdef ROM_SPDE < handle
                     conductivityTransform(generalizedMean(lambda, 1), ct);
                 nFeatures = nFeatures + 1;
 
-                phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-                    conductivities, 'hi', 'ConvexArea', 'max') + log_cutoff);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-                    conductivities, 'lo', 'ConvexArea', 'max') + log_cutoff);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-                    conductivities, 'hi', 'ConvexArea', 'var') + log_cutoff);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-                    conductivities, 'lo', 'ConvexArea', 'var') + log_cutoff);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-                    conductivities, 'hi', 'ConvexArea', 'mean') + log_cutoff);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-                    conductivities, 'lo', 'ConvexArea', 'mean') + log_cutoff);
-                nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
+%                     conductivities, 'hi', 'ConvexArea', 'max') + log_cutoff);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
+%                     conductivities, 'lo', 'ConvexArea', 'max') + log_cutoff);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
+%                     conductivities, 'hi', 'ConvexArea', 'var') + log_cutoff);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
+%                     conductivities, 'lo', 'ConvexArea', 'var') + log_cutoff);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
+%                     conductivities, 'hi', 'ConvexArea', 'mean') + log_cutoff);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
+%                     conductivities, 'lo', 'ConvexArea', 'mean') + log_cutoff);
+%                 nFeatures = nFeatures + 1;
                 
-                phi{k, nFeatures + 1} = @(lambda) ...
-                    connectedPathExist(lambda, 1, conductivities,'x','invdist');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) ...
-                    connectedPathExist(lambda, 1, conductivities,'y','invdist');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) ...
-                    connectedPathExist(lambda, 2, conductivities,'x','invdist');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) ...
-                    connectedPathExist(lambda, 2, conductivities,'y','invdist');
-                nFeatures = nFeatures + 1;
-                
-                phi{k, nFeatures + 1} = @(lambda)...
-                    log(specificSurface(lambda, 1, conductivities, nElf) ...
-                    + log_cutoff);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    log(specificSurface(lambda, 2, conductivities, nElf) ...
-                    + log_cutoff);
-                nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) ...
+%                     connectedPathExist(lambda, 1, conductivities,'x','invdist');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) ...
+%                     connectedPathExist(lambda, 1, conductivities,'y','invdist');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) ...
+%                     connectedPathExist(lambda, 2, conductivities,'x','invdist');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) ...
+%                     connectedPathExist(lambda, 2, conductivities,'y','invdist');
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     log(specificSurface(lambda, 1, conductivities, nElf) ...
+%                     + log_cutoff);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     log(specificSurface(lambda, 2, conductivities, nElf) ...
+%                     + log_cutoff);
+%                 nFeatures = nFeatures + 1;
 
                 
                 phi{k, nFeatures + 1} = @(lambda)...
@@ -4148,67 +3788,67 @@ classdef ROM_SPDE < handle
                     lambda, 1, 'upper');
                 nFeatures = nFeatures + 1;
                 
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'hi', 'euclidean', 'mean');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'hi', 'euclidean', 'var');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'hi', 'euclidean', 'max');
-                nFeatures = nFeatures + 1;
-                
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'hi', 'cityblock', 'mean');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'hi', 'cityblock', 'var');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'hi', 'cityblock', 'max');
-                nFeatures = nFeatures + 1;
-                
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'hi', 'chessboard', 'mean');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'hi', 'chessboard', 'var');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'hi',...
-                    'chessboard', 'max');
-                nFeatures = nFeatures + 1;
-
-                
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'lo', 'euclidean', 'mean');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'lo', 'euclidean', 'var');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'lo', 'euclidean', 'max');
-                nFeatures = nFeatures + 1;
-                
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'lo', 'cityblock', 'mean');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'lo', 'cityblock', 'var');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'lo', 'cityblock', 'max');
-                nFeatures = nFeatures + 1;
-                
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'lo', 'chessboard', 'mean');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'lo', 'chessboard', 'var');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-                    lambda, conductivities, 'lo', 'chessboard', 'max');
-                nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'hi', 'euclidean', 'mean');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'hi', 'euclidean', 'var');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'hi', 'euclidean', 'max');
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'hi', 'cityblock', 'mean');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'hi', 'cityblock', 'var');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'hi', 'cityblock', 'max');
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'hi', 'chessboard', 'mean');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'hi', 'chessboard', 'var');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'hi',...
+%                     'chessboard', 'max');
+%                 nFeatures = nFeatures + 1;
+% 
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'lo', 'euclidean', 'mean');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'lo', 'euclidean', 'var');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'lo', 'euclidean', 'max');
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'lo', 'cityblock', 'mean');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'lo', 'cityblock', 'var');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'lo', 'cityblock', 'max');
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'lo', 'chessboard', 'mean');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'lo', 'chessboard', 'var');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
+%                     lambda, conductivities, 'lo', 'chessboard', 'max');
+%                 nFeatures = nFeatures + 1;
 
                 %Dummy random features
 %                 phi{k, nFeatures + 1} = @(lambda) normrnd(0, 1);
@@ -4230,33 +3870,33 @@ classdef ROM_SPDE < handle
 %                     connectedPathExist(lambda, 2, conductivities, 'y',...
 %                     'invdist');
 %                 nGlobalFeatures = nGlobalFeatures + 1;
-                phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-                    maxExtent(lambda, conductivities, 'hi', 'x');
-                nGlobalFeatures = nGlobalFeatures + 1;
-                phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-                    maxExtent(lambda, conductivities, 'hi', 'y');
-                nGlobalFeatures = nGlobalFeatures + 1;
-                phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-                    maxExtent(lambda, conductivities, 'lo', 'x');
-                nGlobalFeatures = nGlobalFeatures + 1;
-                phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-                    maxExtent(lambda, conductivities, 'lo', 'y');
-                nGlobalFeatures = nGlobalFeatures + 1;
-                phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-                    SCA(lambda, conductivities, ct);
-                nGlobalFeatures = nGlobalFeatures + 1;
-                phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-                    maxwellGarnett(lambda, conductivities, ct, 'lo');
-                nGlobalFeatures = nGlobalFeatures + 1;
-                phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-                    maxwellGarnett(lambda, conductivities, ct, 'hi');
-                nGlobalFeatures = nGlobalFeatures + 1;
-                phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-                    differentialEffectiveMedium(lambda, conductivities,ct,'lo');
-                nGlobalFeatures = nGlobalFeatures + 1;
-                phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-                    differentialEffectiveMedium(lambda, conductivities,ct,'hi');
-                nGlobalFeatures = nGlobalFeatures + 1;
+%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
+%                     maxExtent(lambda, conductivities, 'hi', 'x');
+%                 nGlobalFeatures = nGlobalFeatures + 1;
+%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
+%                     maxExtent(lambda, conductivities, 'hi', 'y');
+%                 nGlobalFeatures = nGlobalFeatures + 1;
+%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
+%                     maxExtent(lambda, conductivities, 'lo', 'x');
+%                 nGlobalFeatures = nGlobalFeatures + 1;
+%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
+%                     maxExtent(lambda, conductivities, 'lo', 'y');
+%                 nGlobalFeatures = nGlobalFeatures + 1;
+%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
+%                     SCA(lambda, conductivities, ct);
+%                 nGlobalFeatures = nGlobalFeatures + 1;
+%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
+%                     maxwellGarnett(lambda, conductivities, ct, 'lo');
+%                 nGlobalFeatures = nGlobalFeatures + 1;
+%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
+%                     maxwellGarnett(lambda, conductivities, ct, 'hi');
+%                 nGlobalFeatures = nGlobalFeatures + 1;
+%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
+%                     differentialEffectiveMedium(lambda, conductivities,ct,'lo');
+%                 nGlobalFeatures = nGlobalFeatures + 1;
+%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
+%                     differentialEffectiveMedium(lambda, conductivities,ct,'hi');
+%                 nGlobalFeatures = nGlobalFeatures + 1;
             end
             
             pltPca = false;

@@ -1,7 +1,7 @@
 %%Script for output prediction
 romObjPred = ROM_SPDE('');
-romObjPred.testSamples = 1:32;
-romObjPred = romObjPred.predict;
+romObjPred.testSamples = 17:32;
+romObjPred.predict;
 
 predMetrics.meanSqDist = romObjPred.meanSquaredDistance;
 predMetrics.meanLogLikelihood = romObjPred.meanLogLikelihood;

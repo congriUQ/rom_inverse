@@ -107,7 +107,7 @@ classdef ROM_SPDE < handle
         nSamples_p_c = 1000
         %Use Laplace approx around MAP for prediction?
         useLaplaceApproximation = false
-        testSamples = 1:6       %pick out specific test samples here
+        testSamples = 17:22       %pick out specific test samples here
         trainingSamples   %pick out specific training samples here
         
         %% Prediction outputs
@@ -1366,7 +1366,7 @@ classdef ROM_SPDE < handle
                 end
                 for i = 1:nSamples
                     FEMout = heat2d(coarseDomain, LambdaSamples{j}(:, i));
-                    uctemp = FEMout.uff';
+                    uctemp = FEMout.u';
                     
                     %sample from p_cf
                     mu_cf = t_cf.mu + t_cf.W*uctemp(:);
@@ -1388,14 +1388,12 @@ classdef ROM_SPDE < handle
                 meanuf_meanMCErr = mean(sqrt(uf_var/nSamples))
                 ufVarArray{j} = uf_var;
                 
-                meanMahaErrTemp{j} = mean(sqrt(abs((1./(uf_var)).*(uf(:, j)...
-                    - ufMeanArray{j}).^2)));
+                meanMahaErrTemp{j} = mean(sqrt(abs((1./(uf_var)).*(uf(:, j) - ufMeanArray{j}).^2)));
                 sqDist{j} = (uf(:, j) - ufMeanArray{j}).^2;
                 meanSqDistTemp{j} = mean(sqDist{j});
                 
                 uf_var_nat = uf_var(natNodes);
-                logLikelihood{j} = -.5*nNatNodes*log(2*pi) -...
-                    .5*sum(log(uf_var_nat), 'omitnan') - ...
+                logLikelihood{j} = -.5*nNatNodes*log(2*pi) - .5*sum(log(uf_var_nat), 'omitnan') - ...
                     .5*sum(sqDist{j}(natNodes)./uf_var_nat, 'omitnan');
                 logPerplexity{j} = -(1/(nNatNodes))*logLikelihood{j};
             end
@@ -1462,7 +1460,7 @@ classdef ROM_SPDE < handle
 %                     zticks(100:100:800)
                     xticklabels({});
                     yticklabels({});
-                    zticklabels({});
+%                     zticklabels({});
                     axis tight;
                     axis square;
                     box on;

@@ -11,8 +11,8 @@ classdef ROM_SPDE < handle
         upperConductivity = 10
         %Conductivity field distribution type
         nBochnerBasis = 10  % Set to false if no fixed basis is desired
-        conductivityDistributionType = 'continuous'     %binary (default) or continuous
-        conductivityDistribution = 'squaredExponential'
+        conductivityDistributionType = "continuous"     %binary (default) or continuous
+        conductivityDistribution = "squaredExponential"
         %Boundary condition functions
         %evaluate those on boundaries to get boundary conditions
         boundaryTemperature
@@ -22,7 +22,7 @@ classdef ROM_SPDE < handle
         
         naturalNodes
         %Directory where finescale data is stored; specify basename here
-        fineScaleDataPath = '~/matlab/data/fineData/'
+        fineScaleDataPath = "~/matlab/data/fineData/"
         %matfile handle
         trainingDataMatfile
         testDataMatfile
@@ -31,7 +31,7 @@ classdef ROM_SPDE < handle
         %Array holding fine scale data output; possibly large
         fineScaleDataOutput
         %number of samples per generated matfile
-        nSets = [4096 4096]
+        nSets = [128 128]
         %Output data characteristics
         outputVariance
         outputMean
@@ -150,7 +150,7 @@ classdef ROM_SPDE < handle
     properties(SetAccess = private)
         %% finescale data specifications
         %delta for fixed length scale, lognormal for rand
-        conductivityLengthScaleDist = 'delta'
+        conductivityLengthScaleDist = "delta"
         
         %{volumeFraction, correlationLength, sigma_f2}
         %for log normal length scale, the
@@ -240,6 +240,19 @@ classdef ROM_SPDE < handle
             end
         end
         
+        function genFineScaleDomain(self)
+            %Generate finescale domain
+            tic
+            disp('Generate fine scale domain...')
+            addpath('./heatFEM')    %to find Domain class
+            self.fineMesh = Domain(self.nElFX, self.nElFY);
+            %Only fix lower left corner as essential node
+            self.fineMesh = setBoundaries(self.fineMesh, self.naturalNodes, self.boundaryTemperature,...
+                                          self.boundaryHeatFlux);
+            disp('done')
+            domain_generating_time = toc
+        end
+        
         function genFineScaleData(self, boundaryConditions, condDistParams)
             %Function to generate and save finescale data
             disp('Generate fine scale data...')
@@ -253,36 +266,29 @@ classdef ROM_SPDE < handle
             end
             
             %for boundary condition functions
-            if(isempty(self.boundaryTemperature) || ...
-                    isempty(self.boundaryHeatFlux))
+            if(isempty(self.boundaryTemperature) || isempty(self.boundaryHeatFlux))
                 self = self.genBoundaryConditionFunctions;
             end
             
-            %% Generate finescale domain
-            tic
-            disp('Generate fine scale domain...')
-            addpath('./heatFEM')    %to find Domain class
-            self.fineMesh = Domain(self.nElFX, self.nElFY);
-            %Only fix lower left corner as essential node
-            self.fineMesh = setBoundaries(self.fineMesh, self.naturalNodes, self.boundaryTemperature,...
-                                          self.boundaryHeatFlux);
-            disp('done')
-            domain_generating_time = toc
+            %Generate fine scale domain
+            self.genFineScaleDomain();
             
             if ~exist(self.fineScaleDataPath, 'dir')
                 mkdir(self.fineScaleDataPath);
             end
             
             %Generate finescale conductivity samples and solve FEM
-            for i = 1:numel(self.nSets)
-                filename = strcat(self.fineScaleDataPath, 'set', num2str(i), '-samples=', num2str(self.nSets(i)));
-                self.solveFEM(i, filename);
+            for n = 1:numel(self.nSets)
+%                 filename = strcat(self.fineScaleDataPath, 'set', num2str(n), '-samples=', num2str(self.nSets(n)));
+                filename = sprintf(self.fineScaleDataPath + "set%u-samples=%u.mat", n, self.nSets(n));
+                [cond, xi] = self.generateConductivityField(n, filename);
+                self.solveFEM(n, cond, filename);
             end
             
             %save params
             fineMesh = self.fineMesh;
             fineMesh = fineMesh.shrink();
-            save(strcat(self.fineScaleDataPath, 'fineMesh.mat'), 'fineMesh');
+            save(self.fineScaleDataPath + "fineMesh.mat", "fineMesh");
             disp('done')
         end
         
@@ -300,21 +306,13 @@ classdef ROM_SPDE < handle
             self.boundaryHeatFlux{4} = @(y) -(bc(2) + bc(4)*y);    %left bound
         end
         
-        function [cond, xi] = generateConductivityField(self, nSet)
+        function [cond, xi] = generateConductivityField(self, nSet, filename)
             %nSet is the number of the data set
             %nSet is the set (file number) index
             
             % Draw conductivity/ log conductivity
             disp('Generating finescale conductivity field...')
             tic
-            %ATTENTION: only isotrop. distributions (length scales) possible. Compute coordinates of element centers
-            x = .5*(self.fineMesh.cum_lElX(1:(end - 1)) + self.fineMesh.cum_lElX(2:end));
-            y = .5*(self.fineMesh.cum_lElY(1:(end - 1)) + self.fineMesh.cum_lElY(2:end));
-            [X, Y] = meshgrid(x, y);
-            %directly clear potentially large arrays
-            clear y;
-            x = [X(:) Y(:)]';
-            clear X Y;
             
             addpath('./computation')        %to find parPoolInit
             parPoolInit(self.nSets(nSet));
@@ -344,6 +342,8 @@ classdef ROM_SPDE < handle
                     xi = [];
                 end
             end
+            save(filename, 'xi', 'sampleFuns', '-v7.3')
+            
             nEl = self.fineMesh.nEl;
             upCond = self.upperConductivity;
             loCond = self.lowerConductivity;
@@ -355,15 +355,23 @@ classdef ROM_SPDE < handle
                 cutoff = zeros(self.nSets(nSet), 1);
                 for i = 1:(self.nSets(nSet))
                     phiRand = rand;
-                    cutoff(i) = norminv(1 - phiRand, 0,...
-                        self.conductivityDistributionParams{3});
+                    cutoff(i) = norminv(1 - phiRand, 0, self.conductivityDistributionParams{3});
                 end
             end
+            
+            %ATTENTION: only isotrop. distributions (length scales) possible. Compute coordinates of element centers
+            x = .5*(self.fineMesh.cum_lElX(1:(end - 1)) + self.fineMesh.cum_lElX(2:end));
+            y = .5*(self.fineMesh.cum_lElY(1:(end - 1)) + self.fineMesh.cum_lElY(2:end));
+            [X, Y] = meshgrid(x, y);
+            %directly clear potentially large arrays
+            clear y;
+            x = [X(:) Y(:)]';
+            clear X Y;
             volfrac = self.conductivityDistributionParams{1};
             conductivityDistributionType = self.conductivityDistributionType;
-            parfor i = 1:(self.nSets(nSet))
+            for i = 1:(self.nSets(nSet))
                 %use for-loop instead of vectorization to save memory
-                if strcmp(conductivityDistributionType, 'continuous')
+                if conductivityDistributionType == "continuous"
                     cond{i} = loCond + exp(sampleFuns{i}(x))';
                 else
                     for j = 1:nEl
@@ -376,19 +384,18 @@ classdef ROM_SPDE < handle
                     end
                 end
             end
+            save(filename, 'cond', '-append')
             disp('done')
             conductivity_generation_time = toc
         end
         
-        function solveFEM(self, nSet, savepath)
-            
-            [cond, xi] = self.generateConductivityField(nSet);
+        function solveFEM(self, nSet, cond, filename)
             %Solve finite element model
             disp('Solving finescale problem...')
             tic
-            uf = zeros(self.fineMesh.nNodes, self.nSets(nSet));
             %cell array for parfor
-            uf = mat2cell(uf, self.fineMesh.nNodes, ones(1, self.nSets(nSet)));
+            uf = mat2cell(zeros(self.fineMesh.nNodes, self.nSets(nSet)), ...
+                          self.fineMesh.nNodes, ones(1, self.nSets(nSet)));
 
             %To avoid broadcasting overhead
             fineMesh = self.fineMesh;
@@ -405,32 +412,17 @@ classdef ROM_SPDE < handle
             
             parPoolInit(self.nSets(nSet));
             addpath('./rom');
-            bcHeatFlux = [];
+            bcFlux = [];
             for i = 1:self.nSets(nSet)
                 if(any(bcVariance))
-                    bcTemperature = @(x) bc{i}(1) + bc{i}(2)*x(1) +...
-                        bc{i}(3)*x(2) + bc{i}(4)*x(1)*x(2);
-                    %lower bound
-                    bcHeatFlux{i}{1} = @(x) -(bc{i}(3) + bc{i}(4)*x);
-                    %right bound
-                    bcHeatFlux{i}{2} = @(y) (bc{i}(2) + bc{i}(4)*y);
-                    %upper bound
-                    bcHeatFlux{i}{3} = @(x) (bc{i}(3) + bc{i}(4)*x);
-                    %left bound
-                    bcHeatFlux{i}{4} = @(y) -(bc{i}(2) + bc{i}(4)*y);
-                    
-                    fineMeshTemp = fineMesh.setBoundaries(...
-                        naturalNodes, bcTemperature, bcHeatFlux{i});
-%                     bcHeatFlux = [];
+                    [bcPressure, bcFlux] = bcCoeffs2Fun(bc{i});
+                    fineMeshTemp = fineMesh.setBoundaries(naturalNodes, bcPressure, bcFlux);
                 else
                     fineMeshTemp = fineMesh;
-%                     bcTemperature = [];
                 end
                 FEMout = heat2d(fineMeshTemp, cond{i});
-                %Store fine temperatures as a vector uf. 
-                %Use reshape(uf(:, i), domain.nElX + 1, domain.nElY + 1)
-                %and then transpose result to reconvert it to
-                %original temperature field
+                %Store fine temperatures as a vector uf, use reshape(uf(:, i), domain.nElX + 1, domain.nElY + 1)
+                %and then transpose result to reconvert it to original temperature field
                 uf{i} = FEMout.u;
             end
             uf = cell2mat(uf);
@@ -438,14 +430,10 @@ classdef ROM_SPDE < handle
             tot_FEM_time = toc
             
             if(nargin > 2)
-                disp('saving finescale data to...')
-                disp(savepath)
-                cond = cell2mat(cond);
-                %partial loading only for -v7.3
+                disp("saving finescale data to " + filename)
+                save(filename,'uf', '-append')
                 if(any(bcVariance))
-                    save(strcat(savepath, ''), 'cond', 'uf', 'xi', 'bc', '-v7.3')
-                else
-                    save(strcat(savepath, ''), 'cond', 'uf', 'xi', '-v7.3')
+                    save(filename, 'bc', '-append')
                 end
                 disp('done')
             end
@@ -454,45 +442,36 @@ classdef ROM_SPDE < handle
         function genFineScaleDataPath(self)
             volFrac = self.conductivityDistributionParams{1};
             sigma_f2 = self.conductivityDistributionParams{3};
-            self.fineScaleDataPath = strcat(self.fineScaleDataPath,...
-                'systemSize=',num2str(self.nElFX), 'x',...
-                num2str(self.nElFY), '/');
+            self.fineScaleDataPath = sprintf(self.fineScaleDataPath + "systemSize=%ux%u/", self.nElFX, self.nElFY);
             %Type of conductivity distribution
-            if(strcmp(self.conductivityDistribution,'squaredExponential') || ...
-               strcmp(self.conductivityDistribution, 'ornsteinUhlenbeck') || ...
-               strcmp(self.conductivityDistribution, 'sincCov') || ...
-               strcmp(self.conductivityDistribution, 'sincSqCov') || ...
-               strcmp(self.conductivityDistribution, 'matern'))
-                if strcmp(self.conductivityLengthScaleDist, 'delta')
-                    if(self.conductivityDistributionParams{2}(1) ==...
-                            self.conductivityDistributionParams{2}(2))
+            if(self.conductivityDistribution == "squaredExponential" || ...
+               self.conductivityDistribution == "ornsteinUhlenbeck" || ...
+               self.conductivityDistribution == "sincCov" || ...
+               self.conductivityDistribution == "sincSqCov" || ...
+               self.conductivityDistribution == "matern")
+                if self.conductivityLengthScaleDist == "delta"
+                    if(self.conductivityDistributionParams{2}(1) == self.conductivityDistributionParams{2}(2))
                         corrLength = self.conductivityDistributionParams{2}(1);
                     else
                         corrLength = self.conductivityDistributionParams{2};
                     end
-                    self.fineScaleDataPath = strcat(self.fineScaleDataPath,...
-                        self.conductivityDistribution, '/', 'l=',...
-                        num2str(corrLength), '_sigmafSq=', num2str(sigma_f2),...
-                        '/volumeFraction=', num2str(volFrac), '/', 'locond=',...
-                        num2str(self.lowerConductivity))
-                    if strcmp(self.conductivityDistributionType, 'continuous')
-                        self.fineScaleDataPath = strcat(self.fineScaleDataPath, '_upcond=continuous')
+                    self.fineScaleDataPath = sprintf(self.fineScaleDataPath + self.conductivityDistribution +...
+                        '/l=%.2f_sigmafSq=%.2f/volumeFraction=%.2f/locond=%.2f',...
+                        corrLength, sigma_f2, volFrac, self.lowerConductivity)
+                    if self.conductivityDistributionType == "continuous"
+                        self.fineScaleDataPath = self.fineScaleDataPath + "_upcond=continuous";
                     else
-                        self.fineScaleDataPath = strcat(self.fineScaleDataPath,...
-                            '_upcond=', num2str(self.upperConductivity))
+                        self.fineScaleDataPath =...
+                            sprintf(self.fineScaleDataPath + "_upcond=%.2f", self.upperConductivity);
                     end
                     self.fineScaleDataPath = strcat(self.fineScaleDataPath, '/BCcoeffs=', self.boundaryConditions, '/');
                 elseif strcmp(self.conductivityLengthScaleDist, 'lognormal')
                     corrLength1 = self.conductivityDistributionParams{2}(1);
                     corrLength2 = self.conductivityDistributionParams{2}(2);
-                    self.fineScaleDataPath = strcat(self.fineScaleDataPath,...
-                        self.conductivityDistribution,'/', 'l=lognormal_mu=',...
-                        num2str(corrLength1), 'sigma=', num2str(corrLength2),...
-                        '_sigmafSq=', num2str(sigma_f2), '/volumeFraction=',...
-                        num2str(volFrac), '/', 'locond=',...
-                        num2str(self.lowerConductivity),...
-                        '_upcond=', num2str(self.upperConductivity),...
-                        '/', 'BCcoeffs=', self.boundaryConditions, '/');
+                    self.fineScaleDataPath = sprintf(self.fineScaleDataPath + self.conductivityDistribution + ...
+                        "/l=lognormal_mu=%.2f_sigma=%.2f_sigmafSq=.2f/volumeFraction=%.2f/locond=%.2f_upcond=%.2f" + ...
+                        "/BCcoeffs=", self.boundaryConditions, '/', corrLength1, corrLength2, sigma_f2, volFrac,...
+                        self.lowerConductivity, self.upperConductivity);
                 else
                     error('Unknown length scale distribution')
                 end
@@ -508,20 +487,15 @@ classdef ROM_SPDE < handle
             end
             
             if(any(self.boundaryConditionVariance))
-                self.fineScaleDataPath =...
-                    strcat(self.fineScaleDataPath, 'BCvar=[',...
-                    num2str(self.boundaryConditionVariance), ']/');
+                self.fineScaleDataPath = strcat(self.fineScaleDataPath, 'BCvar=[',...
+                                                num2str(self.boundaryConditionVariance), ']/');
             end
             
             %Name of training data file
-            trainFileName =...
-                strcat('set1-samples=', num2str(self.nSets(1)), '.mat');
-            self.trainingDataMatfile =...
-                matfile(strcat(self.fineScaleDataPath, trainFileName));
-            testFileName =...
-                strcat('set2-samples=', num2str(self.nSets(2)), '.mat');
-            self.testDataMatfile =...
-                matfile(strcat(self.fineScaleDataPath, testFileName));
+            trainFileName = sprintf("set1-samples=%u.mat", self.nSets(1));
+            self.trainingDataMatfile = matfile(strcat(self.fineScaleDataPath, trainFileName));
+            testFileName = sprintf("set2-samples=%u.mat", self.nSets(2));
+            self.testDataMatfile = matfile(strcat(self.fineScaleDataPath, testFileName));
         end
         
         function loadTrainingData(self)
@@ -1168,8 +1142,7 @@ classdef ROM_SPDE < handle
             end
         end
         
-        function [lambda_theta_c, lambda_log_s2, lambda_log_sigma2] = ...
-                laplaceApproximation(self)
+        function [lambda_theta_c, lambda_log_s2, lambda_log_sigma2] = laplaceApproximation(self)
             %Computes parameter precisions based on second derivatives 
             %of posterior lower bound F
             
@@ -1217,6 +1190,12 @@ classdef ROM_SPDE < handle
                     ((self.thetaPriorHyperparam(2) +...
                     .5*self.theta_c.theta.^2).^2));
             end
+        end
+        
+        function p_ROM(xi, uf)
+            %Takes fine scale basis function coefficients xi and computes
+            %the probability density p(uf|xi) for a fixed uf
+            
         end
         
         function predict(self, mode, boundaryConditions)

@@ -255,7 +255,7 @@ while true
                 variationalDist, sw, dim);
         end
         tocBytes(gcp)
-        parfor_time = toc
+        fprintf("Stochastic VI time: %.2fs\n", toc)
         
         tic
         for i = pstart:pend
@@ -292,20 +292,20 @@ while true
             rom.mean_TcTcT = mean(TcTcT, 3);
         end
         rom.varExpect_p_cf_exp_mean = mean(tempArray, 2);
-        inference_time = toc
-        tic
-        %save('./data/variationalDistributions.mat', 'vi');
-        save_time = toc
-        disp('done')
+        fprintf("Inference time: %.2fs\n", toc)
+%         tic
+%         save('./data/variationalDistributions.mat', 'vi');
+%         save_time = toc
+%         disp('done')
     end
 
     %M-step: determine optimal parameters given the sample set
     tic
     rom.M_step;
-    M_step_time = toc
+    fprintf("M-step time: %.2fs\n", toc)
+    fprintf("Number of iterations: %u\n", rom.EM_iterations)
+    fprintf("Number of epochs: %u\n", rom.epoch)
     rom.dispCurrentParams;
-    iterations = rom.EM_iterations
-    epochs = rom.epoch
     
     plotTheta = feature('ShowFigureWindows');
     if plotTheta
@@ -327,8 +327,7 @@ while true
     
     if(~rom.conductivityTransformation.anisotropy)
         nFeatures = size(rom.designMatrix{1}, 2);
-        Lambda_eff1_mode = conductivityBackTransform(...
-            rom.designMatrix{1}(1:rom.coarseMesh.nEl, 1:nFeatures)...
+        Lambda_eff1_mode = conductivityBackTransform(rom.designMatrix{1}(1:rom.coarseMesh.nEl, 1:nFeatures)...
             *rom.theta_c.theta(1:nFeatures), rom.conductivityTransformation)
     end
     

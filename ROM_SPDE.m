@@ -13,6 +13,7 @@ classdef ROM_SPDE < handle
         nBochnerBasis = 3  % Set to false if no fixed basis is desired
         conductivityDistributionType = "continuous"     %binary (default) or continuous
         conductivityDistribution = "squaredExponential"
+        randFieldGenMatrix      %matrix for quick generation of discretized conductivity fields
         %Boundary condition functions
         %evaluate those on boundaries to get boundary conditions
         boundaryTemperature
@@ -120,7 +121,7 @@ classdef ROM_SPDE < handle
         %% Finescale data
         lambdak
         xk
-        conductivityBasisFunctions
+        conductivityBasisFunctions      %handle to cinductivity basis functions
         conductivityCoefficients
         
         %% Computational quantities
@@ -265,7 +266,7 @@ classdef ROM_SPDE < handle
             %Generate finescale conductivity samples and solve FEM
             for n = 1:numel(self.nSets)
                 filename = sprintf(self.fineScaleDataPath + "set%u-samples=%u.mat", n, self.nSets(n));
-                [cond, xi] = self.generateConductivityField(n, filename);
+                cond = self.generateConductivityField(n, filename);
                 self.solveFEM(n, cond, filename);
             end
             
@@ -304,20 +305,25 @@ classdef ROM_SPDE < handle
                 %Fixed random field basis functions; the only random parameter is the coefficient xi
                 fprintf('Using fixed basis of %u Bochner samples. Randomized length scale not possible.\n',...
                     self.nBochnerBasis)
-                basisFuns = genBochnerSamplesFixedBasis(l, self.conductivityDistributionParams{3}, ...
-                    self.nBochnerBasis, self.conductivityDistribution);
+                self.conductivityBasisFunctions = genBochnerSamplesFixedBasis(...
+                    l, self.conductivityDistributionParams{3}, self.nBochnerBasis, self.conductivityDistribution);
                 xi = normrnd(0, 1, self.nSets(nSet), self.nBochnerBasis);
             else
                 error('Only fixed random field basis functions is implemented.')
             end
             save(filename, 'xi', 'basisFuns', '-v7.3')
             
-            %ATTENTION: only isotrop. distributions (length scales) possible. Compute coordinates of element centers
-            x = self.fineMesh.getCenterCoordinates();
-            randFieldGenMatrix = basisFuns(x)';
-            cond = self.lowerConductivity + exp(randFieldGenMatrix*xi');
+            cond = self.getDiscretizedConductivityField(xi);
             save(filename, 'cond', '-append')
             fprintf('...done. Time: %.2f\n', toc)
+        end
+        
+        function cond = getDiscretizedConductivityField(self, xi)
+            %ATTENTION: only isotrop. distributions (length scales) possible. Compute coordinates of element centers
+            if isempty(self.randFieldGenMatrix)
+                self.randFieldGenMatrix = self.conductivityBasisFunctions(self.fineMesh.getCenterCoordinates())';
+            end
+            cond = self.lowerConductivity + exp(self.randFieldGenMatrix*xi');
         end
         
         function solveFEM(self, nSet, cond, filename)
@@ -449,7 +455,7 @@ classdef ROM_SPDE < handle
                 self.fineMesh.cum_lElY = linspace(0, 1, self.fineMesh.nElY + 1);
             end
             
-%             self.conductivityBasisFunctions = self.trainingDataMatfile.basisFuns{self.trainingSamples};
+            self.conductivityBasisFunctions = self.trainingDataMatfile.basisFuns;
 %             self.conductivityCoefficients = self.trainingDataMatfile.xi(self.trainingSamples, :);
             
             %load finescale temperatures partially
@@ -1583,7 +1589,7 @@ classdef ROM_SPDE < handle
             end
         end
         
-        function computeDesignMatrix(self, mode, recompute)
+        function computeDesignMatrix(self, mode, recompute, xi)
             %Actual computation of design matrix
             %set recompute to true if design matrices have 
             %to be recomputed during optimization (parametric features)
@@ -1604,24 +1610,22 @@ classdef ROM_SPDE < handle
                     error('Compute design matrices for train or test data?')
                 end
                 nData = numel(dataSamples);
-                
-                %%%%%%%%%%%FIXME%%%%%%%%%%%%%%%%%
-                %generate discretized conductivity from xi via basis functions?
-                %load finescale conductivity field
-                conductivity = dataFile.cond(:, dataSamples);
+
+                %Generate discretized conductivity field from basis functions
+                if nargin < 4
+                    xi = dataFile.xi(dataSamples, :);
+                end
+                conductivity = self.getDiscretizedConductivityField(xi);
                 %to avoid parallelization communication overhead
                 conductivity = num2cell(conductivity, 1);
                 
                 %set feature function handles
                 [phi, phiGlobal] = self.setFeatureFunctions;
-                writeFeatureFunctionList(phi, phiGlobal);
+                self.writeFeatureFunctionList(phi, phiGlobal);
                 
                 nFeatureFunctions = size(self.featureFunctions, 2);
                 nGlobalFeatureFunctions = size(self.globalFeatureFunctions, 2);
                 
-                %Open parallel pool
-                addpath('./computation')
-                parPoolInit(nData);
                 PhiCell{1} = zeros(self.coarseMesh.nEl, nFeatureFunctions + nGlobalFeatureFunctions);
                 [lambdak, xk] = self.get_coarseElementConductivities(mode);
                 PhiCell = repmat(PhiCell, nData, 1);
@@ -1631,30 +1635,27 @@ classdef ROM_SPDE < handle
                 nElc = self.coarseMesh.nEl;
                 nElXf = self.fineMesh.nElX;
                 nElYf = self.fineMesh.nElY;
-                ticBytes(gcp)
                 %for cheap features, serial evaluation might be more efficient
                 for s = 1:nData
                     %inputs belonging to same coarse element are in 
                     %the same column of xk. They are ordered in x-direction.
                     
                     %construct conductivity design matrix
-                    for i = 1:nElc
+                    for i = 1:self.coarseMesh.nEl
                         %local features
                         for j = 1:nFeatureFunctions
-                            %only take pixels of corresponding macro-cell 
-                            %as input for features
+                            %only take pixels of corresponding macro-cell as input for features
                             PhiCell{s}(i, j) = phi{i, j}(lambdak{s, i});
                         end
                         %global features
                         for j = 1:nGlobalFeatureFunctions
-                            %Take whole microstructure as input for feature 
-                            %function can be wrong for non-sq. fine domains
-                            conductivityMat = reshape(conductivity{s}, nElXf, nElYf);
+                            %Take whole microstructure as input for feature function can be wrong
+                            %for non-sq. fine domains
+                            conductivityMat = reshape(conductivity{s}, self.fineMesh.nElX, self.fineMesh.nElY);
                             PhiCell{s}(i, nFeatureFunctions + j) = phiGlobal{i, j}(conductivityMat);
                         end
                     end
                 end
-                tocBytes(gcp)
                 
                 %Check for real finite inputs
                 for i = 1:nData
@@ -1725,7 +1726,7 @@ classdef ROM_SPDE < handle
                 self.originalDesignMatrix = [];
             end
             self.computeSumPhiTPhi;
-            Phi_computation_time = toc
+            fprintf("Design matrix computation time: %.2f\n", toc)
         end
         
         function applyDesignMatrixNormalization(self, mode)
@@ -1747,7 +1748,7 @@ classdef ROM_SPDE < handle
             end
         end
         
-        function writeFeatureFunctionList(phi, phiGlobal)
+        function writeFeatureFunctionList(self, phi, phiGlobal)
             for j = 1:size(phi, 2)
                 if(j == 1)
                     dlmwrite('./data/features', func2str(phi{1, j}), 'delimiter', '');

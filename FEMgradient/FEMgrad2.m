@@ -5,8 +5,7 @@ function [d_r] = FEMgrad(u, mesh)
 % mesh: mesh object
 
 % (d/d Lambda_e) k^(e) = (1/Lambda_e) k^(e)     as k^(e) linear in Lambda_e
-d_r = reshape(mesh.d_glob_stiff*sparse(u), mesh.nEq, mesh.nEl)'...
-    - mesh.d_glob_force;
+d_r = reshape(mesh.d_glob_stiff*sparse(u), mesh.nEq, mesh.nEl)' - mesh.d_glob_force;
 
 end
 

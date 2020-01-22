@@ -5,15 +5,6 @@ function [log_p, d_log_p, Tc] = log_p_cf(Tf_i_minus_mu, domainc, Xi, theta_cf, c
 %diagonal S
 
 conductivity = conductivityBackTransform(Xi, condTransOpts);
-% D = zeros(2, 2, domainc.nEl);
-% %Conductivity matrix D, only consider isotropic materials here
-% for j = 1:domainc.nEl
-%     D(:, :, j) =  conductivity(j)*eye(2);
-% end
-% 
-% FEMout = heat2d(domainc, D);
-
-
 FEMout = heat2d(domainc, conductivity);
 
 Tc = FEMout.u;
@@ -23,8 +14,7 @@ if onlyGrad
     log_p = [];
 else
     %only for diagonal S!
-    log_p = -.5*(theta_cf.sumLogS + (Tf_i_minus_mu_minus_WTc)'*...
-        (theta_cf.Sinv_vec.*(Tf_i_minus_mu_minus_WTc)));
+    log_p = -.5*(theta_cf.sumLogS + (Tf_i_minus_mu_minus_WTc)'*(theta_cf.Sinv_vec.*(Tf_i_minus_mu_minus_WTc)));
 end
 
 if nargout > 1
@@ -36,13 +26,12 @@ if nargout > 1
     if strcmp(condTransOpts.type, 'log')
         %We need gradient of r w.r.t. log conductivities X, multiply 
         %each row with resp. conductivity
-        d_rx(1:domainc.nEl, :) = diag(conductivity)*d_r(1:domainc.nEl, :);
+        d_rx(1:domainc.nEl, :) = conductivity.*d_r(1:domainc.nEl, :);
     elseif strcmp(condTransOpts.type, 'logit')
         %We need gradient w.r.t. x, where x is
         %- log((lambda_up - lambda_lo)/(lambda - lambda_lo) - 1)
         X = conductivityTransform(conductivity, condTransOpts);
-        dLambda_dX = (condTransOpts.limits(2) - condTransOpts.limits(1))./...
-            (exp(X) + 2 + exp(-X));
+        dLambda_dX = (condTransOpts.limits(2) - condTransOpts.limits(1))./(exp(X) + 2 + exp(-X));
         d_rx = dLambda_dX.*d_r;
     elseif strcmp(condTransOpts.type, 'log_lower_bound')
         %transformation is X = log(Lambda - lambda_lo)
@@ -54,8 +43,7 @@ if nargout > 1
     else
         error('Unknown conductivity transformation')
     end
-    adjoints = get_adjoints(FEMout.globalStiffness,...
-        theta_cf, domainc, Tf_i_minus_mu_minus_WTc);
+    adjoints = get_adjoints(FEMout.globalStiffness, theta_cf, domainc, Tf_i_minus_mu_minus_WTc);
     d_log_p = - d_rx*adjoints;
 
     

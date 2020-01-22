@@ -32,8 +32,6 @@ classdef Domain
         Bvec                        %Shape function gradient array, precomputed for performance
         d_N                         %Shape function gradient array for Gauss quadrature of convection matrix
         NArray
-        convectionMatrix            %Precomputed matrix to accelerate convection term integration
-        useConvection               %Use a convection term in the PDE
         
         essentialBoundary           %essential boundary (yes or no) given local node and element number
         lm                          %lm takes element number as row and local node number as column index
@@ -281,19 +279,6 @@ classdef Domain
                 %gradient precomputation
                 self = self.get_glob_force_grad();
             end
-        end
-        
-        function self = setConvectionMatrix(self)
-            %Only call if necessary. This is memory consuming!
-            disp('Setting convection matrix...')
-            
-            self = self.elementShapeFunctionArray;
-            self = self.elementShapeFunctionGradients;
-            self.convectionMatrix = zeros(4, 8, self.nEl);
-            for e = 1:self.nEl
-                self.convectionMatrix(:, :, e) = self.NArray(:, :, e)*self.d_N(:, :, e);
-            end
-            disp('done')
         end
 
         function self = setHeatSource(self, heatSourceField)
@@ -612,7 +597,7 @@ classdef Domain
             self.d_glob_stiff = [];
             self.d_glob_stiff_assemble = spalloc(self.nEq*self.nEq, self.nEl, 16*self.nEl);
             kIndexMat = sparse(1:length(self.kIndex), self.kIndex, ones(1, length(self.kIndex)));
-            disp('Setting up stiffness stencil, this may take a while...')
+            fprintf("Setting up stiffness stencil, this may take a while...\n")
             tic
             for e = 1:self.nEl
 %                 grad_loc_k = zeros(4, 4, self.nEl);
@@ -628,8 +613,8 @@ classdef Domain
                 self.d_glob_stiff = [self.d_glob_stiff; d_Ke];
                 self.d_glob_stiff_assemble(:, e) = sparse(d_Ke(:));
             end
-            toc
-            disp('...stiffness stencil set up.')
+            t = toc;
+            fprintf('...stiffness stencil set up. Time: %.2fs\n', t)
             self.d_glob_stiff_assemble = sparse(self.d_glob_stiff_assemble);
         end
         
@@ -640,6 +625,14 @@ classdef Domain
 %                     self.d_loc_stiff(:, :, e), e);
 %             end
 %         end
+
+        function x = getCenterCoordinates(self)
+            %Returns a 2 x Nel Array of center element coordinates
+            x = .5*(self.cum_lElX(1:(end - 1)) + self.cum_lElX(2:end));
+            y = .5*(self.cum_lElY(1:(end - 1)) + self.cum_lElY(2:end));
+            [X, Y] = meshgrid(x, y);
+            x = [X(:) Y(:)]';
+        end
 
         function self = get_glob_force_grad(self)
             %compute global force gradient matrix

@@ -3,15 +3,6 @@
 %load old configuration? (Optimal parameters, optimal variational distributions
 loadOldConf = false;
 
-%linear filter options
-rom.linFilt.type = 'local';  %local or global
-rom.linFilt.gap = 0;
-rom.linFilt.initialEpochs = 200;
-rom.linFilt.updates = 0;     %Already added linear filters
-rom.linFilt.totalUpdates = 0;
-rom.maxEpochs = (rom.linFilt.totalUpdates + 1)*rom.linFilt.gap - 2 +...
-    rom.linFilt.initialEpochs;
-
 
 %% Start value of model parameters
 %Shape function interpolate in W
@@ -19,7 +10,7 @@ rom.theta_cf.W = shapeInterp(rom.coarseMesh, rom.fineMesh);
 %shrink finescale domain object to save memory
 rom.fineMesh = rom.fineMesh.shrink();
 if loadOldConf
-    disp('Loading old configuration...')
+    fprintf('Loading old configuration...\n')
     rom.theta_cf.S = dlmread('./data/S')';
     rom.theta_cf.mu = dlmread('./data/mu')';
     rom.theta_c.theta = dlmread('./data/theta');

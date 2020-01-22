@@ -36,7 +36,7 @@ ppool = parPoolInit(rom.nTrain);
 pend = 0;       %for sequential qi-updates
 
 %Compute design matrices
-rom.computeDesignMatrix('train', false);
+rom.computeDesignMatrix("train", false);
 if(size(rom.designMatrix{1}, 2) ~= size(rom.theta_c.theta))
     warning('Wrong dim of theta_c. Setting it to 0 with correct dim.')
     rom.theta_c.theta = zeros(size(rom.designMatrix{1}, 2), 1);
@@ -78,12 +78,7 @@ while true
             nY = rom.coarseMesh.nElY;
             bc = rom.trainingDataMatfile.bc;
             j = rom.trainingSamples(i);
-            bcT = @(x)...
-                bc{j}(1) + bc{j}(2)*x(1) + bc{j}(3)*x(2) + bc{j}(4)*x(1)*x(2);
-            bcQ{1} = @(x) -(bc{j}(3) + bc{j}(4)*x);      %lower bound
-            bcQ{2} = @(y) (bc{j}(2) + bc{j}(4)*y);       %right bound
-            bcQ{3} = @(x) (bc{j}(3) + bc{j}(4)*x);       %upper bound
-            bcQ{4} = @(y) -(bc{j}(2) + bc{j}(4)*y);      %left bound
+            [bcT, bcQ] = bcCoeffs2Fun(bc{j});
             cm(i) = rom.coarseMesh;
             cm(i) = cm(i).setBoundaries([2:(2*nX + 2*nY)], bcT, bcQ);
             cd_i = cm(i);
@@ -242,7 +237,7 @@ while true
         end
         
         %This can probably be done more memory efficient
-        disp('Finding optimal variational distributions...')
+        fprintf("Finding optimal variational distributions...\n")
         
         dim = rom.coarseMesh.nEl;
         
@@ -256,8 +251,8 @@ while true
         tic
         ticBytes(gcp)
         parfor i = pstart:pend
-            [varDistParams{i}, varDistParamsVec{i}] = efficientStochOpt(...
-                varDistParamsVec{i}, log_qi{i}, variationalDist, sw, dim);
+            [varDistParams{i}, varDistParamsVec{i}] = efficientStochOpt(varDistParamsVec{i}, log_qi{i},...
+                variationalDist, sw, dim);
         end
         tocBytes(gcp)
         parfor_time = toc
@@ -284,8 +279,7 @@ while true
                 Tc(:, i) = Tc_i;
                 TcTcT(:, :, i) = TcTcT_i;
             else
-                p_cf_exp = mcInference(...
-                    p_cf_expHandle{i}, variationalDist, varDistParams{i});
+                p_cf_exp = mcInference(p_cf_expHandle{i}, variationalDist, varDistParams{i});
             end
             tempArray(:, i) = p_cf_exp;
         end
@@ -312,13 +306,11 @@ while true
     rom.dispCurrentParams;
     iterations = rom.EM_iterations
     epochs = rom.epoch
-    rom.linearFilterUpdate;
     
     plotTheta = feature('ShowFigureWindows');
     if plotTheta
         if ~exist('figureTheta')
-            figureTheta =...
-                figure('units','normalized','outerposition',[0 0 .5 1]);
+            figureTheta = figure('units','normalized','outerposition',[0 0 .5 1]);
         end
         rom.plotTheta(figureTheta);
     end
@@ -327,8 +319,7 @@ while true
     if pltState
         % Plot data and reconstruction (modal value)
         if ~exist('figResponse')
-            figResponse =...
-                figure('units','normalized','outerposition',[0 0 1 1]);
+            figResponse = figure('units','normalized','outerposition',[0 0 1 1]);
         end
         %plot modal lambda_c and corresponding -training- data reconstruction
         rom.plotCurrentState(figResponse, 0);

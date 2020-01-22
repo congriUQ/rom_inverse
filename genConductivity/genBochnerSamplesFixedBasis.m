@@ -1,4 +1,4 @@
-function [sampleFuns, xi] = genBochnerSamplesFixedBasis(lengthScale, sigma_f2, nBasisFunctions, nSamples, type)
+function [basisFuns] = genBochnerSamplesFixedBasis(lengthScale, sigma_f2, nBasisFunctions, type)
 %Generate approximate Gaussian process sample functions in analytical form using Bochner's theorem
 
 if numel(lengthScale) == 1
@@ -42,14 +42,11 @@ end
 %Stacked samples from b, see notes
 b = 2*pi*rand(nBasisFunctions, 1);
 
-%Draw coefficients gamma
-xi = normrnd(0, 1, nSamples, nBasisFunctions);
-
 %Handle to sample functions
-sampleFuns = {};
-for i = 1:nSamples
-    sampleFuns{i} = @(x) sqrt((2*sigma_f2)/nBasisFunctions)*(xi(i, :)*cos(W*x + b));
-end
+% basisFuns = {};
+% for i = 1:nSamples
+basisFuns = @(x) sqrt((2*sigma_f2)/nBasisFunctions)*cos(W*x + b);
+% end
 
 
 end

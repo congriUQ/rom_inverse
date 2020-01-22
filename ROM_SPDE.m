@@ -10,7 +10,7 @@ classdef ROM_SPDE < handle
         lowerConductivity = 1
         upperConductivity = 10
         %Conductivity field distribution type
-        nBochnerBasis = 10  % Set to false if no fixed basis is desired
+        nBochnerBasis = 3  % Set to false if no fixed basis is desired
         conductivityDistributionType = "continuous"     %binary (default) or continuous
         conductivityDistribution = "squaredExponential"
         %Boundary condition functions
@@ -22,7 +22,7 @@ classdef ROM_SPDE < handle
         
         naturalNodes
         %Directory where finescale data is stored; specify basename here
-        fineScaleDataPath = "~/matlab/data/fineData/"
+        fineScaleDataPath
         %matfile handle
         trainingDataMatfile
         testDataMatfile
@@ -31,7 +31,7 @@ classdef ROM_SPDE < handle
         %Array holding fine scale data output; possibly large
         fineScaleDataOutput
         %number of samples per generated matfile
-        nSets = [128 128]
+        nSets = [4096 4096]
         %Output data characteristics
         outputVariance
         outputMean
@@ -39,7 +39,7 @@ classdef ROM_SPDE < handle
         E                   %Mapping from fine to coarse cell index
         neighborDictionary %Gives neighbors of macrocells
         %% Model training parameters
-        nStart = 17              %first training data sample in file
+        nStart = 1              %first training data sample in file
         nTrain = 16             %number of samples used for training
         mode = 'none'           %useNeighbor, useLocalNeighbor, useDiagNeighbor,
                                 %useLocalDiagNeighbor, useLocal, global
@@ -49,11 +49,6 @@ classdef ROM_SPDE < handle
         %E-step inference method. variationalInference or monteCarlo
         inferenceMethod = 'variationalInference'
         
-        %% Sequential addition of linear filters
-        linFilt
-        
-        %Use autoencoder information? Do not forget to pre-train autoencoder!
-        useAutoEnc = false
         %Principal components of the whole microstructure used as features 
         globalPcaComponents = 3
         %Principal components of single macro-cell used as features
@@ -79,10 +74,6 @@ classdef ROM_SPDE < handle
         featureFunctions
         %cell array with handles to global feature functions
         globalFeatureFunctions
-        %Cell array containing local convection feature function handles
-        convectionFeatureFunctions
-        %cell array with handles to global convection feature functions
-        globalConvectionFeatureFunctions
         %transformation of finescale conductivity to real axis
         conductivityTransformation
         latentDim = 0              %If autoencoder is used
@@ -126,9 +117,11 @@ classdef ROM_SPDE < handle
         meanMahalanobisError
         meanEffCond
         
-        %% Finescale data- only load this to memory when needed!
+        %% Finescale data
         lambdak
         xk
+        conductivityBasisFunctions
+        conductivityCoefficients
         
         %% Computational quantities
         varExpect_p_cf_exp_mean
@@ -157,8 +150,6 @@ classdef ROM_SPDE < handle
         %length scale parameters are log normal mu and
         %sigma
         conductivityDistributionParams = {-1 [.2 .2] 1}
-        %mu and sigma for advection field coefficients
-        advectionDistributionParams = [10, 15]
         
         %Coefficients giving boundary conditions, specify as string
         boundaryConditions = '[0 1 1 0]'
@@ -203,39 +194,33 @@ classdef ROM_SPDE < handle
             self.XMean = zeros(self.coarseMesh.nEl, self.nTrain);
             self.XSqMean = ones(self.coarseMesh.nEl, self.nTrain);
             %Set up default value for test samples
-            self.nStart = randi(self.nSets(1) - self.nTrain, 1)
+            self.nStart = randi(self.nSets(1) - self.nTrain, 1);
             self.trainingSamples = self.nStart:(self.nStart + self.nTrain - 1);
             
             %Set conductivity transformation
             self.conductivityTransformation.anisotropy = false;
-            self.conductivityTransformation.type = 'logit';
+            self.conductivityTransformation.type = 'log';
             if strcmp(self.conductivityTransformation.type, 'log')
                 self.conductivityTransformation.limits = [1e-6 1e6];
             elseif strcmp(self.conductivityTransformation.type, 'logit')
-                self.conductivityTransformation.limits =...
-                    [(1 - 1e-2)*self.lowerConductivity,...
-                    (1 + 1e-2)*self.upperConductivity];
+                self.conductivityTransformation.limits = [(1 - 1e-2)*self.lowerConductivity,...
+                                                            (1 + 1e-2)*self.upperConductivity];
             else
                 self.conductivityTransformation.limits = [1e-8 1e8];
             end
             conductivityTransformation = self.conductivityTransformation;
-            save('./data/conductivityTransformation',...
-                'conductivityTransformation');
+            save('./data/conductivityTransformation', 'conductivityTransformation');
             
-            self.linFilt.totalUpdates = 0;
             if ~strcmp(mode, 'genData')
                 %Load fine scale domain and set boundary conditions
                 self.loadTrainingData;
                 %Set up feature function handles
-                %obj = obj.setFeatureFunctions;
                 %Prealloc
-                self.varExpect_p_cf_exp_mean =...
-                    zeros(self.fineMesh.nNodes, 1);
+                self.varExpect_p_cf_exp_mean = zeros(self.fineMesh.nNodes, 1);
             end
             
             %Check
-            if(strcmp(self.thetaPriorType, 'sharedRVM') &&...
-                    ~strcmp(self.mode, 'useLocal'))
+            if(strcmp(self.thetaPriorType, 'sharedRVM') && ~strcmp(self.mode, 'useLocal'))
                 error('sharedRVM prior only allowed for useLocal mode')
             end
         end
@@ -267,7 +252,7 @@ classdef ROM_SPDE < handle
             
             %for boundary condition functions
             if(isempty(self.boundaryTemperature) || isempty(self.boundaryHeatFlux))
-                self = self.genBoundaryConditionFunctions;
+                self.genBoundaryConditionFunctions;
             end
             
             %Generate fine scale domain
@@ -279,7 +264,6 @@ classdef ROM_SPDE < handle
             
             %Generate finescale conductivity samples and solve FEM
             for n = 1:numel(self.nSets)
-%                 filename = strcat(self.fineScaleDataPath, 'set', num2str(n), '-samples=', num2str(self.nSets(n)));
                 filename = sprintf(self.fineScaleDataPath + "set%u-samples=%u.mat", n, self.nSets(n));
                 [cond, xi] = self.generateConductivityField(n, filename);
                 self.solveFEM(n, cond, filename);
@@ -298,8 +282,7 @@ classdef ROM_SPDE < handle
                 error('No string specified for boundary conditions')
             end
             bc = str2num(self.boundaryConditions);
-            self.boundaryTemperature =...
-                @(x) bc(1) + bc(2)*x(1) + bc(3)*x(2) + bc(4)*x(1)*x(2);
+            self.boundaryTemperature = @(x) bc(1) + bc(2)*x(1) + bc(3)*x(2) + bc(4)*x(1)*x(2);
             self.boundaryHeatFlux{1} = @(x) -(bc(3) + bc(4)*x);    %lower bound
             self.boundaryHeatFlux{2} = @(y) (bc(2) + bc(4)*y);     %right bound
             self.boundaryHeatFlux{3} = @(x) (bc(3) + bc(4)*x);     %upper bound
@@ -309,93 +292,42 @@ classdef ROM_SPDE < handle
         function [cond, xi] = generateConductivityField(self, nSet, filename)
             %nSet is the number of the data set
             %nSet is the set (file number) index
+            addpath('./genConductivity')    %to find genBochnerSamples
+            addpath('./rom');
             
-            % Draw conductivity/ log conductivity
-            disp('Generating finescale conductivity field...')
+            % Draw conductivity/log conductivity
+            fprintf('Generating finescale conductivity field...\n')
             tic
             
-            addpath('./computation')        %to find parPoolInit
-            parPoolInit(self.nSets(nSet));
-            %Store conductivity fields in cell array to avoid broadcasting the whole data
-            cond = repmat({zeros(self.fineMesh.nEl, 1)}, 1, self.nSets(nSet));
             l = self.conductivityDistributionParams{2};
-            
-            addpath('./genConductivity')        %to find genBochnerSamples
             if self.nBochnerBasis
                 %Fixed random field basis functions; the only random parameter is the coefficient xi
-                fprintf('Using fixed basis of %u Bochner samples. Randomized length scale not possible.',...
+                fprintf('Using fixed basis of %u Bochner samples. Randomized length scale not possible.\n',...
                     self.nBochnerBasis)
-                [sampleFuns, xi] = genBochnerSamplesFixedBasis(l, self.conductivityDistributionParams{3}, ...
-                    self.nBochnerBasis, self.nSets(nSet), self.conductivityDistribution);
+                basisFuns = genBochnerSamplesFixedBasis(l, self.conductivityDistributionParams{3}, ...
+                    self.nBochnerBasis, self.conductivityDistribution);
+                xi = normrnd(0, 1, self.nSets(nSet), self.nBochnerBasis);
             else
-                for i = 1:(self.nSets(nSet))
-                    if strcmp(self.conductivityLengthScaleDist, 'lognormal')
-                        %First and second parameters are mu and sigma of lognormal dist
-                        l = lognrnd(self.conductivityDistributionParams{2}(1), ...
-                            self.conductivityDistributionParams{2}(2));
-                        l = [l, l];
-                    else
-                        error('Unknown length scale distribution')
-                    end
-                    sampleFuns{i} = genBochnerSamples(l, self.conductivityDistributionParams{3}, self.nBochnerBasis,...
-                        self.conductivityDistribution);
-                    xi = [];
-                end
+                error('Only fixed random field basis functions is implemented.')
             end
-            save(filename, 'xi', 'sampleFuns', '-v7.3')
-            
-            nEl = self.fineMesh.nEl;
-            upCond = self.upperConductivity;
-            loCond = self.lowerConductivity;
-            %set volume fraction parameter < 0 to have
-            %uniformly random volume fraction
-            if(self.conductivityDistributionParams{1} >= 0)
-                cutoff = norminv(1 - self.conductivityDistributionParams{1}, 0, self.conductivityDistributionParams{3});
-            else
-                cutoff = zeros(self.nSets(nSet), 1);
-                for i = 1:(self.nSets(nSet))
-                    phiRand = rand;
-                    cutoff(i) = norminv(1 - phiRand, 0, self.conductivityDistributionParams{3});
-                end
-            end
+            save(filename, 'xi', 'basisFuns', '-v7.3')
             
             %ATTENTION: only isotrop. distributions (length scales) possible. Compute coordinates of element centers
-            x = .5*(self.fineMesh.cum_lElX(1:(end - 1)) + self.fineMesh.cum_lElX(2:end));
-            y = .5*(self.fineMesh.cum_lElY(1:(end - 1)) + self.fineMesh.cum_lElY(2:end));
-            [X, Y] = meshgrid(x, y);
-            %directly clear potentially large arrays
-            clear y;
-            x = [X(:) Y(:)]';
-            clear X Y;
-            volfrac = self.conductivityDistributionParams{1};
-            conductivityDistributionType = self.conductivityDistributionType;
-            for i = 1:(self.nSets(nSet))
-                %use for-loop instead of vectorization to save memory
-                if conductivityDistributionType == "continuous"
-                    cond{i} = loCond + exp(sampleFuns{i}(x))';
-                else
-                    for j = 1:nEl
-                        ps = sampleFuns{i}(x(:, j));
-                        if(volfrac >= 0)
-                            cond{i}(j) = upCond*(ps > cutoff) + loCond*(ps <= cutoff);
-                        else
-                            cond{i}(j) = upCond*(ps > cutoff(i)) + loCond*(ps <= cutoff(i));
-                        end
-                    end
-                end
-            end
+            x = self.fineMesh.getCenterCoordinates();
+            randFieldGenMatrix = basisFuns(x)';
+            cond = self.lowerConductivity + exp(randFieldGenMatrix*xi');
             save(filename, 'cond', '-append')
-            disp('done')
-            conductivity_generation_time = toc
+            fprintf('...done. Time: %.2f\n', toc)
         end
         
         function solveFEM(self, nSet, cond, filename)
             %Solve finite element model
-            disp('Solving finescale problem...')
+            addpath('./computation')        %parpool
+            fprintf('Solving finescale problem...\n')
             tic
             %cell array for parfor
             uf = mat2cell(zeros(self.fineMesh.nNodes, self.nSets(nSet)), ...
-                          self.fineMesh.nNodes, ones(1, self.nSets(nSet)));
+                                self.fineMesh.nNodes, ones(1, self.nSets(nSet)));
 
             %To avoid broadcasting overhead
             fineMesh = self.fineMesh;
@@ -411,8 +343,6 @@ classdef ROM_SPDE < handle
             end
             
             parPoolInit(self.nSets(nSet));
-            addpath('./rom');
-            bcFlux = [];
             for i = 1:self.nSets(nSet)
                 if(any(bcVariance))
                     [bcPressure, bcFlux] = bcCoeffs2Fun(bc{i});
@@ -420,28 +350,34 @@ classdef ROM_SPDE < handle
                 else
                     fineMeshTemp = fineMesh;
                 end
-                FEMout = heat2d(fineMeshTemp, cond{i});
+                FEMout = heat2d(fineMeshTemp, cond(:, i));
                 %Store fine temperatures as a vector uf, use reshape(uf(:, i), domain.nElX + 1, domain.nElY + 1)
                 %and then transpose result to reconvert it to original temperature field
                 uf{i} = FEMout.u;
             end
             uf = cell2mat(uf);
-            disp('FEM systems solved')
-            tot_FEM_time = toc
+            fprintf('FEM systems solved. Time: %.2fs\n', toc)
             
             if(nargin > 2)
-                disp("saving finescale data to " + filename)
+                fprintf("saving finescale data to " + filename + "\n")
                 save(filename,'uf', '-append')
                 if(any(bcVariance))
                     save(filename, 'bc', '-append')
                 end
-                disp('done')
+                fprintf('done.')
             end
         end
         
         function genFineScaleDataPath(self)
             volFrac = self.conductivityDistributionParams{1};
             sigma_f2 = self.conductivityDistributionParams{3};
+            if string(java.net.InetAddress.getLocalHost.getHostName) == "workstation1-room0436"
+                %workstation
+                self.fineScaleDataPath = "~/cluster/matlab/data/fineData/";
+            else
+                %cluster
+                self.fineScaleDataPath = "~/matlab/data/fineData/";
+            end
             self.fineScaleDataPath = sprintf(self.fineScaleDataPath + "systemSize=%ux%u/", self.nElFX, self.nElFY);
             %Type of conductivity distribution
             if(self.conductivityDistribution == "squaredExponential" || ...
@@ -476,12 +412,9 @@ classdef ROM_SPDE < handle
                     error('Unknown length scale distribution')
                 end
             elseif strcmp(cond_distribution, 'binary')
-                self.fineScaleDataPath = strcat(self.fineScaleDataPath,...
-                    self.conductivityDistribution, '/volumeFraction=',...
-                    num2str(volFrac), '/', 'locond=',...
-                    num2str(self.lowerConductivity), '_upcond=',...
-                    num2str(self.upperConductivity), '/', 'BCcoeffs=',...
-                    self.boundaryConditions, '/');
+                self.fineScaleDataPath = sprintf(self.fineScaleDataPath + self.conductivityDistribution +...
+                    '/volumeFraction=%.2f/locond=%.2f_upcond=%.2f/BCcoeffs='+ self.boundaryConditions + '/',...
+                    volFrac, self.lowerConductivity, self.upperConductivity);
             else
                 error('Unknown conductivity distribution')
             end
@@ -501,28 +434,26 @@ classdef ROM_SPDE < handle
         function loadTrainingData(self)
             %load data params; warning for variable FD can be ignored
             self.fineScaleDataPath
-            load(strcat(self.fineScaleDataPath, 'fineMesh.mat'));
+            load(self.fineScaleDataPath + "fineMesh.mat", "fineMesh");
             self.fineMesh = fineMesh;
             %for finescale domain class
             addpath('./heatFEM')
             %for boundary condition functions
-            if(isempty(self.boundaryTemperature) || ...
-                    isempty(self.boundaryHeatFlux))
+            if(isempty(self.boundaryTemperature) || isempty(self.boundaryHeatFlux))
                 self = self.genBoundaryConditionFunctions;
             end
             
             %there is no cum_lEl (cumulated finite element length) in old files
-            if(~numel(self.fineMesh.cum_lElX) ||...
-                    ~numel(self.fineMesh.cum_lElX))
-                self.fineMesh.cum_lElX =...
-                    linspace(0, 1, self.fineMesh.nElX + 1);
-                self.fineMesh.cum_lElY =...
-                    linspace(0, 1, self.fineMesh.nElY + 1);
+            if(~numel(self.fineMesh.cum_lElX) || ~numel(self.fineMesh.cum_lElX))
+                self.fineMesh.cum_lElX = linspace(0, 1, self.fineMesh.nElX + 1);
+                self.fineMesh.cum_lElY = linspace(0, 1, self.fineMesh.nElY + 1);
             end
             
+%             self.conductivityBasisFunctions = self.trainingDataMatfile.basisFuns{self.trainingSamples};
+%             self.conductivityCoefficients = self.trainingDataMatfile.xi(self.trainingSamples, :);
+            
             %load finescale temperatures partially
-            self.fineScaleDataOutput = self.trainingDataMatfile.uf(:,...
-                self.nStart:(self.nStart + self.nTrain - 1));
+            self.fineScaleDataOutput = self.trainingDataMatfile.uf(:, self.nStart:(self.nStart + self.nTrain - 1));
         end
         
         function genCoarseMesh(self)
@@ -750,15 +681,13 @@ classdef ROM_SPDE < handle
             %Optimal S (decelerated convergence)
             lowerBoundS = eps;
             self.theta_cf.S = (1 - self.mix_S)*self.varExpect_p_cf_exp_mean...
-                + self.mix_S*self.theta_cf.S +...
-                lowerBoundS*ones(self.fineMesh.nNodes, 1);
+                + self.mix_S*self.theta_cf.S + lowerBoundS*ones(self.fineMesh.nNodes, 1);
 
             if self.free_W
                 self.mean_ucucT(self.coarseMesh.essentialNodes, :) = [];
                 self.mean_ucucT(:, self.coarseMesh.essentialNodes) = [];
                 if isempty(self.fineMesh.essentialNodes)
-                    warning(strcat('No essential nodes stored in', ...
-                    ' fineMesh. Setting first node to be essential.'))
+                    warning("No essential nodes stored in fineMesh. Setting first node to be essential.")
                     self.fineMesh.essentialNodes = 1;
                 end
                 self.mean_ufucT(self.fineMesh.essentialNodes, :) = [];
@@ -807,11 +736,9 @@ classdef ROM_SPDE < handle
             
             %sum_i Phi_i^T Sigma^-1 <X^i>_qi
             sumPhiTSigmaInvXmean = 0;
-            sumPhiTSigmaInvXmeanOriginal = 0;
             SigmaInv = self.theta_c.SigmaInv;
             SigmaInvXMean = SigmaInv*self.XMean;
             sumPhiTSigmaInvPhi = 0;
-            sumPhiTSigmaInvPhiOriginal = 0;
             PhiThetaMat = zeros(self.coarseMesh.nEl, self.nTrain);
             
             for n = 1:self.nTrain
@@ -837,8 +764,6 @@ classdef ROM_SPDE < handle
                         warning('resizing theta hyperparam')
                         self.thetaPriorHyperparam = 1e-4*ones(dim_theta, 1);
                     end
-%                     lambda_start = [obj.thetaPriorHyperparam (1:100)']
-%                     obj.thetaPriorHyperparam = 1e4*ones(dim_theta, 1);
 					nElc = self.coarseMesh.nEl;
 					nFeatures = dim_theta/nElc; %for shared RVM
                 end
@@ -852,41 +777,25 @@ classdef ROM_SPDE < handle
                             (muTilde'*muTilde + trace(SigmaTilde));
                     elseif(strcmp(self.thetaPriorType, 'RVM') ||...
                             strcmp(self.thetaPriorType, 'sharedRVM'))
-                        SigmaTilde = inv(sumPhiTSigmaInvPhi + ...
-                            diag(self.thetaPriorHyperparam));
-%                         muTilde = SigmaTilde*sumPhiTSigmaInvXmean;
-%                         muTilde = obj.theta_c.theta;
-                        muTilde = (sumPhiTSigmaInvPhi +...
-                           diag(self.thetaPriorHyperparam))\...
-                           sumPhiTSigmaInvXmean;
+                        SigmaTilde = inv(sumPhiTSigmaInvPhi + diag(self.thetaPriorHyperparam));
+                        muTilde = (sumPhiTSigmaInvPhi + diag(self.thetaPriorHyperparam))\sumPhiTSigmaInvXmean;
                         theta_prior_hyperparam_old = self.thetaPriorHyperparam;
                         if strcmp(self.thetaPriorType, 'RVM')
-%                           gamma=1-obj.thetaPriorHyperparam.*diag(SigmaTilde);
-%                           gamma(gamma <= 0) = eps;
-                            self.thetaPriorHyperparam =...
-                                1./(muTilde.^2 + diag(SigmaTilde));
-%                             obj.thetaPriorHyperparam =...
-                            %gamma./(muTilde.^2 + 1e-10);
+                            self.thetaPriorHyperparam = 1./(muTilde.^2 + diag(SigmaTilde));
                         elseif strcmp(self.thetaPriorType, 'sharedRVM')
                             muTildeSq = muTilde.^2;
                             varTilde = diag(SigmaTilde);
-                            lambdaInv =...
-                                (1/nElc)*(sum(reshape(muTildeSq, nFeatures,...
-                                nElc), 2) + sum(reshape(varTilde, nFeatures,...
-                                nElc), 2));
-                            self.thetaPriorHyperparam =...
-                                repmat(1./lambdaInv, nElc, 1);
+                            lambdaInv = (1/nElc)*(sum(reshape(muTildeSq, nFeatures, nElc), 2) +...
+                                sum(reshape(varTilde, nFeatures, nElc), 2));
+                            self.thetaPriorHyperparam = repmat(1./lambdaInv, nElc, 1);
                         end
-                        self.thetaPriorHyperparam = ...
-                            self.thetaPriorHyperparam + stabilityParam;
+                        self.thetaPriorHyperparam = self.thetaPriorHyperparam + stabilityParam;
                     end
                     crit = norm(1./self.thetaPriorHyperparam -...
-                        1./theta_prior_hyperparam_old)/norm(1./...
-                        self.thetaPriorHyperparam);
+                        1./theta_prior_hyperparam_old)/norm(1./self.thetaPriorHyperparam);
                     if(crit < 1e-5 || iter >= 5)
                         converged = true;
-                    elseif(any(~isfinite(self.thetaPriorHyperparam)) ||...
-                            any(self.thetaPriorHyperparam <= 0))
+                    elseif(any(~isfinite(self.thetaPriorHyperparam)) || any(self.thetaPriorHyperparam <= 0))
                         converged = true;
                         muTilde.^2
                         self.thetaPriorHyperparam
@@ -1114,32 +1023,6 @@ classdef ROM_SPDE < handle
             end
             mean_S = mean(self.theta_cf.S)
             %curr_theta_hyperparam = obj.thetaPriorHyperparam
-        end
-        
-        function linearFilterUpdate(self)
-            if(self.linFilt.totalUpdates > 0 && ~strcmp(self.mode, 'useLocal'))
-                error('Use local mode for seq. addition of basis functions')
-            end
-            
-            if(self.epoch > self.linFilt.initialEpochs &&...
-                    mod((self.epoch - self.linFilt.initialEpochs + 1),...
-                    self.linFilt.gap) == 0 &&...
-                    self.epoch ~= self.epoch_old &&...
-                    self.linFilt.updates < self.linFilt.totalUpdates)
-                self.linFilt.updates = self.linFilt.updates + 1;
-                if strcmp(self.linFilt.type, 'local')
-                    self = self.addLinearFilterFeature;
-                elseif strcmp(self.linFilt.type, 'global')
-                    self = self.addGlobalLinearFilterFeature;
-                else
-                    
-                end
-                %Recompute theta_c and sigma
-                self.theta_c = optTheta_c(self.theta_c, self.nTrain,...
-                    self.coarseMesh.nEl, self.XSqMean, ...
-                    self.designMatrix, self.XMean, self.sigmaPriorType,...
-                    self.sigmaPriorHyperparam);
-            end
         end
         
         function [lambda_theta_c, lambda_log_s2, lambda_log_sigma2] = laplaceApproximation(self)
@@ -1415,7 +1298,7 @@ classdef ROM_SPDE < handle
                 cond = ((min_uf - max_uf)/(min(min(cond)) - max(max(cond))))*cond + max_uf - ...
                     ((min_uf - max_uf)/(min(min(cond)) - max(max(cond))))*max(max(cond));
                 for i = pstart:(pstart + 5)
-                    subplot(2, 3, j)
+                    ax = subplot(2, 3, j);
                     uf_i_min = min(uf(:, i))
                     s(j, 1) = surf(reshape(uf(:, i) - uf_i_min, (self.nElFX + 1), (self.nElFY + 1)));
                     s(j, 1).LineStyle = 'none';
@@ -1431,8 +1314,8 @@ classdef ROM_SPDE < handle
                         sqrt(reshape(ufVarArray{i}, (self.nElFX + 1), (self.nElFY + 1))));
                     s(j, 4).LineStyle = 'none';
                     s(j, 4).FaceColor = [.85 .85 .85];
-                    ax = gca;
                     ax.FontSize = 30;
+                    ax.View = [-125, -5];
                     im(j) = imagesc(reshape(cond(:, i), self.fineMesh.nElX, self.fineMesh.nElY));
                     xticks([0 64 128 192 256]);
                     yticks([0 64 128 192 256]);
@@ -1443,7 +1326,6 @@ classdef ROM_SPDE < handle
                     axis tight;
                     axis square;
                     box on;
-                    view(-60, 15)
                     zlim([min_uf max_uf]);
                     caxis([min_uf max_uf]);
                     j = j + 1;
@@ -1452,8 +1334,7 @@ classdef ROM_SPDE < handle
             end
         end
 
-        function [predMean, predSqMean] = randThetaPredict(self, mode,...
-                nSamplesTheta, boundaryConditions)
+        function [predMean, predSqMean] = randThetaPredict(self, mode, nSamplesTheta, boundaryConditions)
             %Function to predict finescale output from generative model
             
             if(nargin < 2)
@@ -1706,22 +1587,12 @@ classdef ROM_SPDE < handle
             %Actual computation of design matrix
             %set recompute to true if design matrices have 
             %to be recomputed during optimization (parametric features)
-            debug = false; %for debug mode
             tic
-            if(self.loadDesignMatrix && ~recompute && strcmp(mode, 'train'))
+            if(self.loadDesignMatrix && ~recompute && mode == "train")
                 load(strcat('./persistentData/', mode, 'DesignMatrix.mat'));
                 self.designMatrix = designMatrix;
-                if self.useAutoEnc
-                    load('./persistentData/latentDim');
-                    self.latentDim = latentDim;
-                end
-                if(self.linFilt.totalUpdates > 0)
-                    load('./persistentData/lambdak');
-                    self.lambdak = lambdak;
-                    self.xk = xk;
-                end
             else
-                disp('Compute design matrices...')
+                fprintf('Computing design matrices...\n')
                 
                 if strcmp(mode, 'train')
                     dataFile = self.trainingDataMatfile;
@@ -1734,6 +1605,8 @@ classdef ROM_SPDE < handle
                 end
                 nData = numel(dataSamples);
                 
+                %%%%%%%%%%%FIXME%%%%%%%%%%%%%%%%%
+                %generate discretized conductivity from xi via basis functions?
                 %load finescale conductivity field
                 conductivity = dataFile.cond(:, dataSamples);
                 %to avoid parallelization communication overhead
@@ -1741,73 +1614,23 @@ classdef ROM_SPDE < handle
                 
                 %set feature function handles
                 [phi, phiGlobal] = self.setFeatureFunctions;
-                for j = 1:size(phi, 2)
-                    if(j == 1)
-                        dlmwrite('./data/features', func2str(phi{1, j}),...
-                            'delimiter', '');
-                    else
-                        dlmwrite('./data/features', func2str(phi{1, j}),...
-                            'delimiter', '', '-append');
-                    end
-                end
-                for j = 1:size(phiGlobal, 2)
-                    dlmwrite('./data/features', func2str(phiGlobal{1, j}),...
-                        'delimiter', '', '-append');
-                end
+                writeFeatureFunctionList(phi, phiGlobal);
+                
                 nFeatureFunctions = size(self.featureFunctions, 2);
                 nGlobalFeatureFunctions = size(self.globalFeatureFunctions, 2);
                 
-                %phi = obj.featureFunctions;
-                %phiGlobal = obj.globalFeatureFunctions;
                 %Open parallel pool
                 addpath('./computation')
                 parPoolInit(nData);
-                PhiCell{1} = zeros(self.coarseMesh.nEl,...
-                    nFeatureFunctions + nGlobalFeatureFunctions);
+                PhiCell{1} = zeros(self.coarseMesh.nEl, nFeatureFunctions + nGlobalFeatureFunctions);
                 [lambdak, xk] = self.get_coarseElementConductivities(mode);
-                ak = [];
                 PhiCell = repmat(PhiCell, nData, 1);
-                
-                if(self.linFilt.totalUpdates > 0)
-                    %These only need to be stored if we seq. add features
-                    self.lambdak = lambdak;
-                    self.xk = xk;
-                    save('./persistentData/lambdak', 'lambdak', 'xk');
-                end
-                
-                if self.useAutoEnc
-                    %should work for training as well as testing
-                    %Only for square grids!!!
-                    lambdakMat = zeros(numel(lambdak{1}), numel(lambdak));
-                    m = 1;
-                    for n = 1:size(lambdak, 1)
-                        for k = 1:size(lambdak, 2)
-                            lambdakMat(:, m) = lambdak{n, k}(:);
-                            m = m + 1;
-                        end
-                    end
-                    lambdakMatBin= logical(lambdakMat - self.lowerConductivity);
-                    %Encoded version of test samples
-                    load('./autoencoder/trainedAutoencoder.mat');
-                    latentMu = ba.encode(lambdakMatBin);
-                    self.latentDim = ba.latentDim;
-                    latentDim = ba.latentDim;
-                    save('./persistentData/latentDim', 'latentDim');
-                    if ~debug
-                        clear ba;
-                    end
-                    latentMu = reshape(latentMu, self.latentDim,...
-                        self.coarseMesh.nEl, nData);
-                else
-                    latentMu = [];
-                end
+
                 
                 %avoid broadcasting overhead
                 nElc = self.coarseMesh.nEl;
                 nElXf = self.fineMesh.nElX;
                 nElYf = self.fineMesh.nElY;
-                uae = self.useAutoEnc;
-                ld = self.latentDim;
                 ticBytes(gcp)
                 %for cheap features, serial evaluation might be more efficient
                 for s = 1:nData
@@ -1826,52 +1649,13 @@ classdef ROM_SPDE < handle
                         for j = 1:nGlobalFeatureFunctions
                             %Take whole microstructure as input for feature 
                             %function can be wrong for non-sq. fine domains
-                            conductivityMat =...
-                                reshape(conductivity{s}, nElXf, nElYf);
-                            PhiCell{s}(i, nFeatureFunctions + j) =...
-                                phiGlobal{i, j}(conductivityMat);
-                        end
-                        if uae
-                            for j = 1:ld
-                                PhiCell{s}(i, nFeatureFunctions +...
-                                    nGlobalFeatureFunctions + j) =...
-                                    latentMu(j, i, s);
-                            end
+                            conductivityMat = reshape(conductivity{s}, nElXf, nElYf);
+                            PhiCell{s}(i, nFeatureFunctions + j) = phiGlobal{i, j}(conductivityMat);
                         end
                     end
                 end
                 tocBytes(gcp)
                 
-                if debug
-                    for n = 1:nData
-                        for k = 1:self.coarseMesh.nEl
-                            decodedDataTest = ba.decode(latentMu(:, k, n));
-                            subplot(1,3,1)
-                            imagesc(reshape(decodedDataTest, 64, 64))
-                            axis square
-                            grid off
-                            yticks({})
-                            xticks({})
-                            colorbar
-                            subplot(1,3,2)
-                            imagesc(reshape(decodedDataTest > 0.5, 64, 64))
-                            axis square
-                            grid off
-                            yticks({})
-                            xticks({})
-                            colorbar
-                            subplot(1,3,3)
-                            imagesc(lambdak{n, k})
-                            axis square
-                            yticks({})
-                            xticks({})
-                            grid off
-                            colorbar
-                            drawnow
-                            pause(.5)
-                        end
-                    end
-                end
                 %Check for real finite inputs
                 for i = 1:nData
                     if(~all(all(all(isfinite(PhiCell{i})))))
@@ -1912,24 +1696,13 @@ classdef ROM_SPDE < handle
                 else
                     error('Wrong design matrix computation model')
                 end
-                %Normalize design matrices
-                if strcmp(self.featureScaling, 'standardize')
-                    self.standardizeDesignMatrix(mode, PhiCell);
-                elseif strcmp(self.featureScaling, 'rescale')
-                    self.rescaleDesignMatrix(mode, PhiCell);
-                elseif strcmp(self.featureScaling, 'normalize')
-                    self.normalizeDesignMatrix(mode, PhiCell);
-                else
-                    disp('No feature scaling used...')
-                end
-                
+                                
                 %Design matrix is always stored in its original form.
                 %Local modes are applied after loading
                 if strcmp(mode, 'train')
                     designMatrix = self.designMatrix;
                     self.originalDesignMatrix = self.designMatrix;
-                    save(strcat('./persistentData/', mode,...
-                        'DesignMatrix.mat'), 'designMatrix')
+                    save(strcat('./persistentData/', mode, 'DesignMatrix.mat'), 'designMatrix')
                 end
             end
 
@@ -1955,6 +1728,38 @@ classdef ROM_SPDE < handle
             Phi_computation_time = toc
         end
         
+        function applyDesignMatrixNormalization(self, mode)
+            %Normalize design matrices
+            if self.featureScaling == "standardize"
+                self.standardizeDesignMatrix(mode, PhiCell);
+                frintf("Feature functions standardized.\n")
+                warning("Feature normalization not possible for inverse problems.")
+            elseif self.featureScaling == "rescale"
+                self.rescaleDesignMatrix(mode, PhiCell);
+                frintf("Feature functions rescaled.\n")
+                warning("Feature normalization not possible for inverse problems.")
+            elseif self.featureScaling == "normalize"
+                self.normalizeDesignMatrix(mode, PhiCell);
+                frintf("Feature Functions normalized.\n")
+                warning("Feature normalization not possible for inverse problems.")
+            else
+                frintf("No feature normalization used.\n")
+            end
+        end
+        
+        function writeFeatureFunctionList(phi, phiGlobal)
+            for j = 1:size(phi, 2)
+                if(j == 1)
+                    dlmwrite('./data/features', func2str(phi{1, j}), 'delimiter', '');
+                else
+                    dlmwrite('./data/features', func2str(phi{1, j}), 'delimiter', '', '-append');
+                end
+            end
+            for j = 1:size(phiGlobal, 2)
+                dlmwrite('./data/features', func2str(phiGlobal{1, j}), 'delimiter', '', '-append');
+            end
+        end
+        
         function secondOrderFeatures(self, mode)
             %Includes second order multinomial terms, i.e. a_ij phi_i phi_j, 
             %where a_ij is logical. Squared term phi_i^2 if a_ii ~= 0. 
@@ -1966,11 +1771,8 @@ classdef ROM_SPDE < handle
             assert(sum(sum(tril(self.secondOrderTerms, -1))) == 0,...
                 'Matrix A must be upper triangular')
             
-            nFeatureFunctions = size(self.featureFunctions, 2) +...
-                size(self.globalFeatureFunctions, 2);
-            if self.useAutoEnc
-                nFeatureFunctions = nFeatureFunctions + self.latentDim;
-            end
+            nFeatureFunctions = size(self.featureFunctions, 2) + size(self.globalFeatureFunctions, 2);
+
             nSecondOrderTerms = sum(sum(self.secondOrderTerms));
             if nSecondOrderTerms
                 disp('Using second order terms of feature functions...')
@@ -2020,11 +1822,9 @@ classdef ROM_SPDE < handle
             %Must be executed BEFORE useLocal etc.
             self.featureFunctionMean = 0;
             for n = 1:numel(self.designMatrix)
-                self.featureFunctionMean =...
-                    self.featureFunctionMean + mean(self.designMatrix{n}, 1);
+                self.featureFunctionMean = self.featureFunctionMean + mean(self.designMatrix{n}, 1);
             end
-            self.featureFunctionMean =...
-                self.featureFunctionMean/numel(self.designMatrix);
+            self.featureFunctionMean = self.featureFunctionMean/numel(self.designMatrix);
         end
 
         function computeFeatureFunctionSqMean(self)
@@ -2096,7 +1896,7 @@ classdef ROM_SPDE < handle
             elseif strcmp(mode, 'test')
                 self.testDesignMatrix = designMatrix;
             else
-                error('wrong mode')
+                error('Unknown mode')
             end
             self.saveNormalization('standardization');
             disp('done')
@@ -2169,14 +1969,10 @@ classdef ROM_SPDE < handle
             self.featureFunctionMin = self.designMatrix{1};
             self.featureFunctionMax = self.designMatrix{1};
             for n = 1:numel(self.designMatrix)
-                self.featureFunctionMin(self.featureFunctionMin >...
-                    self.designMatrix{n}) =...
-                    self.designMatrix{n}(self.featureFunctionMin >...
-                    self.designMatrix{n});
-                self.featureFunctionMax(self.featureFunctionMax <...
-                    self.designMatrix{n}) =...
-                    self.designMatrix{n}(self.featureFunctionMax <...
-                    self.designMatrix{n});
+                self.featureFunctionMin(self.featureFunctionMin > self.designMatrix{n}) =...
+                    self.designMatrix{n}(self.featureFunctionMin > self.designMatrix{n});
+                self.featureFunctionMax(self.featureFunctionMax < self.designMatrix{n}) =...
+                    self.designMatrix{n}(self.featureFunctionMax < self.designMatrix{n});
             end
         end
         
@@ -2235,31 +2031,27 @@ classdef ROM_SPDE < handle
             disp('done')
         end
         
-        function saveNormalization(obj, type)
+        function saveNormalization(self, type)
             disp('Saving design matrix normalization...')
-            if(isempty(obj.featureFunctionMean))
-                obj = obj.computeFeatureFunctionMean;
+            if(isempty(self.featureFunctionMean))
+                self.computeFeatureFunctionMean;
             end
-            if(isempty(obj.featureFunctionSqMean))
-                obj = obj.computeFeatureFunctionSqMean;
+            if(isempty(self.featureFunctionSqMean))
+                self.computeFeatureFunctionSqMean;
             end
             if ~exist('./data')
                 mkdir('./data');
             end
             if strcmp(type, 'standardization')
-                featureFunctionMean = obj.featureFunctionMean;
-                featureFunctionSqMean = obj.featureFunctionSqMean;
-                save('./data/featureFunctionMean', 'featureFunctionMean',...
-                    '-ascii');
-                save('./data/featureFunctionSqMean', 'featureFunctionSqMean',...
-                    '-ascii');
+                featureFunctionMean = self.featureFunctionMean;
+                featureFunctionSqMean = self.featureFunctionSqMean;
+                save('./data/featureFunctionMean', 'featureFunctionMean', '-ascii');
+                save('./data/featureFunctionSqMean', 'featureFunctionSqMean', '-ascii');
             elseif strcmp(type, 'rescaling')
-                featureFunctionMin = obj.featureFunctionMin;
-                featureFunctionMax = obj.featureFunctionMax;
-                save('./data/featureFunctionMin', 'featureFunctionMin',...
-                    '-ascii');
-                save('./data/featureFunctionMax', 'featureFunctionMax',...
-                    '-ascii');
+                featureFunctionMin = self.featureFunctionMin;
+                featureFunctionMax = self.featureFunctionMax;
+                save('./data/featureFunctionMin', 'featureFunctionMin', '-ascii');
+                save('./data/featureFunctionMax', 'featureFunctionMax', '-ascii');
             else
                 error('Which type of data normalization?')
             end
@@ -2901,11 +2693,7 @@ classdef ROM_SPDE < handle
 
         function p = plot_p_c_regression(self, features)
             %Plots regressions of single features to the data <X>_q
-            totalFeatures = size(self.featureFunctions, 2) +...
-                size(self.globalFeatureFunctions, 2);
-            if self.useAutoEnc
-                totalFeatures = totalFeatures + self.latentDim;
-            end
+            totalFeatures = size(self.featureFunctions, 2) + size(self.globalFeatureFunctions, 2);
             totalFeatures
 
             iter = 1;
@@ -3037,8 +2825,7 @@ classdef ROM_SPDE < handle
             sb1 = subplot(3, 2, 1, 'Parent', figHandle);
             plot(self.thetaArray, 'linewidth', 1, 'Parent', sb1)
             axis(sb1, 'tight');
-            sb1.YLim = [(min(self.thetaArray(end, :)) - 1),...
-                (max(self.thetaArray(end, :)) + 1)];
+            sb1.YLim = [(min(self.thetaArray(end, :)) - 1), (max(self.thetaArray(end, :)) + 1)];
             
             sb2 = subplot(3, 2, 2, 'Parent', figHandle);
             bar(self.theta_c.theta, 'linewidth', 1, 'Parent', sb2)
@@ -3080,7 +2867,7 @@ classdef ROM_SPDE < handle
             %Plots the current modal effective property and the modal
             %reconstruction for 2 -training- samples
             %load finescale conductivity field
-            conductivity = self.trainingDataMatfile.cond(:, (self.nStart + dataOffset):(self.nStart + dataOffset + 3));
+            conductivity = self.trainingDataMatfile.cond(:, self.trainingSamples(1:4));
             for i = 1:4
                 Lambda_eff_mode = conductivityBackTransform(self.designMatrix{i + dataOffset}*self.theta_c.theta,...
                     self.conductivityTransformation);
@@ -3143,6 +2930,7 @@ classdef ROM_SPDE < handle
                 sb3.BoxStyle = 'full';
                 sb3.XTick = [];
                 sb3.YTick = [];
+                sb3.View = [-125, -5];
                 cbp_reconst = colorbar('Parent', fig);
             end
             drawnow
@@ -3150,177 +2938,7 @@ classdef ROM_SPDE < handle
 
         
         
-        
-        
-        function addLinearFilterFeature(self)            
-            assert(strcmp(self.mode, 'useLocal'),...
-                'Err: seq. add. of lin. filters only working in useLocal mode');
-            
-%             sigma2Inv_vec = (1./diag(obj.theta_c.Sigma));
-            XMeanMinusPhiThetac= zeros(self.coarseMesh.nEl, self.nTrain);
-            for i = 1:self.nTrain
-                XMeanMinusPhiThetac(:, i) = self.XMean(:, i) -...
-                    self.designMatrix{i}*self.theta_c.theta;
-            end
-            
-            %We use different linear filters for different macro-cells k
-            w{1} = 0;
-            w = repmat(w, self.coarseMesh.nEl, 1);
-            E = zeros(1, self.coarseMesh.nEl);
-            for m = 1:self.coarseMesh.nEl
-                for i = 1:self.nTrain
-%                     w{m} = w{m} + sigma2Inv_vec(m)*...
-%                         XMeanMinusPhiThetac(m, i)*obj.xk{i, m}(:);
-                    %should be still correct without the sigma and
-                    %subsequent normalization
-                    w{m} = w{m} + XMeanMinusPhiThetac(m, i)*self.xk{i, m}(:);
-                end
-                %normalize
-                E(m) = norm(w{m});
-%                 w{m} = w{m}'/E(m);
-                w{m} = w{m}'/norm(w{m}, 1);
-            end
-            
-            %save w
-            filename = './data/w.mat';
-            if exist(filename, 'file')
-                load(filename)  %load w_all
-            else
-                w_all = {};
-            end
-            %append current w's as cell array column index
-            nFeaturesBefore = size(self.featureFunctions, 2);
-            nLinFiltersBefore = size(w_all, 2);
-            for m = 1:self.coarseMesh.nEl
-                w_all{m, nLinFiltersBefore + 1} = w{m};
-                self.featureFunctions{m, nFeaturesBefore + 1} =...
-                    @(lambda) sum(w{m}'.*conductivityTransform(lambda(:),...
-                    self.conductivityTransformation));
-            end
-            
-            save(filename, 'w_all');
-            %save E
-            filename = './data/E';
-            save(filename, 'E', '-ascii', '-append');
-            
-            f = figure;
-            for m = 1:self.coarseMesh.nEl
-                subplot(self.coarseMesh.nElX,...
-                    self.coarseMesh.nElY, m);
-                imagesc(reshape(w{m}, size(self.xk{1, m})))
-                axis square
-                grid off
-                xticks({})
-                yticks({})
-                colorbar
-            end
-            drawnow
-            
-            %% recompute design matrices
-            %this can be done more efficiently!
-            self.computeDesignMatrix('train', true);
-            
-            %% append theta-value
-            nTotalFeaturesAfter = size(self.designMatrix{1}, 2);
-            theta_new = zeros(nTotalFeaturesAfter, 1);
-            j = 1;
-            for i = 1:nTotalFeaturesAfter
-                if(mod(i, nTotalFeaturesAfter/self.coarseMesh.nEl) == 0)
-                    theta_new(i) = 0;
-                else
-                    theta_new(i) = self.theta_c.theta(j);
-                    j = j + 1;
-                end
-            end
-            self.theta_c.theta = theta_new;
-        end
-
-        function addGlobalLinearFilterFeature(self)
-            assert(strcmp(self.mode, 'useLocal'),...
-                'Err: seq. add. of lin. filters only working in useLocal mode');
-            XMeanMinusPhiThetac = zeros(self.coarseMesh.nEl,self.nTrain);
-            for i = 1:self.nTrain
-                XMeanMinusPhiThetac(:, i) = self.XMean(:, i) -...
-                    self.designMatrix{i}*self.theta_c.theta;
-            end
-            
-            conductivity= self.trainingDataMatfile.cond(:,self.trainingSamples);
-            
-            %We use different linear filters for different macro-cells k
-            w{1} = 0;
-            w = repmat(w, self.coarseMesh.nEl, 1);
-            EGlobal = zeros(1, self.coarseMesh.nEl);
-            for m = 1:self.coarseMesh.nEl
-                for i = 1:self.nTrain
-                    w{m} = w{m} + XMeanMinusPhiThetac(m, i)*...
-                        conductivityTransform(conductivity(:, i),...
-                        self.conductivityTransformation);
-                end
-                %normalize
-                EGlobal(m) = norm(w{m});
-%                 w{m} = w{m}'/EGlobal(m);
-                w{m} = w{m}'/norm(w{m}, 1);
-            end
-            
-            %save w
-            filename = './data/wGlobal.mat';
-            if exist(filename, 'file')
-                load(filename)  %load w_allGlobal
-            else
-                w_allGlobal = {};
-            end
-            %append current w's as cell array column index
-            nGlobalFeaturesBefore = size(self.globalFeatureFunctions, 2);
-            nGlobalLinFiltersBefore = size(w_allGlobal, 2);
-            for m = 1:self.coarseMesh.nEl
-                w_allGlobal{m, nGlobalLinFiltersBefore + 1} = w{m};
-                self.globalFeatureFunctions{m, nGlobalFeaturesBefore + 1} =...
-                    @(lambda) sum(w{m}'.*...
-                    conductivityTransform(lambda(:),...
-                    self.conductivityTransformation));
-            end
-            
-            save(filename, 'w_allGlobal');
-            %save E
-            filename = './data/EGlobal';
-            save(filename, 'EGlobal', '-ascii', '-append');
-            
-            f = figure;
-            for m = 1:self.coarseMesh.nEl
-                subplot(self.coarseMesh.nElX,...
-                    self.coarseMesh.nElY, m);
-                imagesc(reshape(w{m}, self.fineMesh.nElX,...
-                    self.fineMesh.nElY))
-                axis square
-                grid off
-                xticks({})
-                yticks({})
-                colorbar
-            end
-            drawnow
-            
-            %% recompute design matrices
-            %this can be done more efficiently!
-            self.computeDesignMatrix('train', true);
-            
-            %% extend theta vector
-            nTotalFeaturesAfter = size(self.designMatrix{1}, 2);
-            theta_new = zeros(nTotalFeaturesAfter, 1);
-            j = 1;
-            for i = 1:nTotalFeaturesAfter
-                if(mod(i, nTotalFeaturesAfter/self.coarseMesh.nEl) == 0)
-                    theta_new(i) = 0;
-                else
-                    theta_new(i) = self.theta_c.theta(j);
-                    j = j + 1;
-                end
-            end
-            self.theta_c.theta = theta_new;
-            
-        end
-
-        function [X, Y, corrX_log_p_cf, corrX, corrY, corrXp_cf,...
-                corrpcfX, corrpcfY] = findMeshRefinement(self)
+        function [X, Y, corrX_log_p_cf, corrX, corrY, corrXp_cf, corrpcfX, corrpcfY] = findMeshRefinement(self)
             %Script to sample d_log_p_cf under p_c to find where 
             %to refine mesh next
 
@@ -3415,7 +3033,7 @@ classdef ROM_SPDE < handle
         
         
         %% Setter functions
-        function self = setConductivityDistributionParams(self, condDistParams)
+        function setConductivityDistributionParams(self, condDistParams)
             self.conductivityDistributionParams = condDistParams;
             self.generateFineScaleDataPath;
         end
@@ -3423,8 +3041,7 @@ classdef ROM_SPDE < handle
         function setBoundaryConditions(self, boundaryConditions)
             %Coefficients of boundary condition functions 
             %must be given as string
-            assert(ischar(boundaryConditions),...
-                'boundaryConditions must be given as string');
+            assert(ischar(boundaryConditions), 'boundaryConditions must be given as string');
             self.boundaryConditions = boundaryConditions;
             self.genBoundaryConditionFunctions;
         end
@@ -3440,11 +3057,9 @@ classdef ROM_SPDE < handle
                     warning('Less samples than specified are available for PCA')
                 end
                 
-                condUnsup = self.trainingDataMatfile.cond(:,1:self.pcaSamples)';
-                pcaComponents = pca(condUnsup, 'NumComponents', ...
-                    self.globalPcaComponents);
-                save(strcat(self.fineScaleDataPath, 'globalPCA.mat'),...
-                    'pcaComponents');
+                condUnsup = self.trainingDataMatfile.cond(:, 1:self.pcaSamples)';
+                pcaComponents = pca(condUnsup, 'NumComponents', self.globalPcaComponents);
+                save(strcat(self.fineScaleDataPath, 'globalPCA.mat'), 'pcaComponents');
             end
             
             pltPca = false;
@@ -3523,125 +3138,22 @@ classdef ROM_SPDE < handle
             disp('done')
         end
 
-        function [phi, phiGlobal, phiConvection, phiGlobalConvection] =...
-                setFeatureFunctions(self)
+        function [phi, phiGlobal] = setFeatureFunctions(self)
             %Set up feature function handles; First cell array index is
             %for macro-cell. This allows different features for different
             %macro-cells
-
             addpath('./featureFunctions')   %Path to feature function library
-            conductivities = [self.lowerConductivity self.upperConductivity];
             log_cutoff = 1e-5;
             phi = {};
             phiGlobal = {};
             %avoid broadcasting overhead in designMatrix
             ct = self.conductivityTransformation;
-            nElf = [self.nElFX self.nElFY];
-            %constant bias
+            
             for k = 1:self.coarseMesh.nEl
                 nFeatures = 0;
+                %constant bias
                 phi{k, nFeatures + 1} = @(lambda) 1;
                 nFeatures = nFeatures + 1;
-%                 
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     SCA(lambda, conductivities, ct);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     maxwellGarnett(lambda, conductivities, ct, 'lo');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     maxwellGarnett(lambda, conductivities, ct, 'hi');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     differentialEffectiveMedium(lambda, conductivities,ct,'lo');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     differentialEffectiveMedium(lambda, conductivities,ct,'hi');
-%                 nFeatures = nFeatures + 1;
-%                 
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     log(linealPath(lambda, 4, 'x', 2, conductivities) +...
-%                     linealPath(lambda, 4, 'y', 2, conductivities) + 1/4096);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     log(linealPath(lambda, 4, 'x', 1, conductivities) +...
-%                     linealPath(lambda, 4, 'y', 1, conductivities) + 1/4096);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     log(linealPath(lambda, 7, 'x', 2, conductivities) +...
-%                     linealPath(lambda, 7, 'y', 2, conductivities) + 1/4096);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     log(linealPath(lambda, 7, 'x', 1, conductivities) +...
-%                     linealPath(lambda, 7, 'y', 1, conductivities) + 1/4096);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     log(linealPath(lambda, 10, 'x', 2, conductivities) +...
-%                     linealPath(lambda, 10, 'y', 2, conductivities) + 1/4096);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     log(linealPath(lambda, 10, 'x', 1, conductivities) +...
-%                     linealPath(lambda, 10, 'y', 1, conductivities) + 1/4096);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
-%                     (2:2:8)', conductivities, 1, 'a');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
-%                     (2:2:8)', conductivities, 1, 'b');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
-%                     (2:2:8)', conductivities, 2, 'a');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) linPathParams(lambda,...
-%                     (2:2:8)', conductivities, 2, 'b');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     linealPath(lambda, 3, 'y', 2, conductivities);
-%                 nFeatures = nFeatures + 1;
-% %                 phi{k, nFeatures + 1} = @(lambda)...
-% %                     linealPath(lambda, 3, 'x', 1, conductivities);
-% %                 nFeatures = nFeatures + 1;
-% %                 phi{k, nFeatures + 1} = @(lambda)...
-% %                     linealPath(lambda, 3, 'y', 1, conductivities);
-% %                 nFeatures = nFeatures + 1;
-% %                 phi{k, nFeatures + 1} = @(lambda)...
-% %                     linealPath(lambda, 6, 'x', 1, conductivities);
-% %                 nFeatures = nFeatures + 1;
-% %                 phi{k, nFeatures + 1} = @(lambda)...
-% %                     linealPath(lambda, 6, 'y', 1, conductivities);
-% %                 nFeatures = nFeatures + 1;
-% % 
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     numberOfObjects(lambda, conductivities, 'hi');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     numberOfObjects(lambda, conductivities, 'lo');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     nPixelCross(lambda, 'y', 1, conductivities, 'max');
-% 				nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     nPixelCross(lambda, 'x', 1, conductivities, 'max');
-% 				nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     nPixelCross(lambda, 'y', 2, conductivities, 'max');
-% 				nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     nPixelCross(lambda, 'x', 2, conductivities, 'max');
-% 				nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     maxExtent(lambda, conductivities, 'hi', 'y');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     maxExtent(lambda, conductivities, 'hi', 'x');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     maxExtent(lambda, conductivities, 'lo', 'y');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     maxExtent(lambda, conductivities, 'lo', 'x');
-%                 nFeatures = nFeatures + 1;
-                
 
                 phi{k, nFeatures + 1} = @(lambda)...
                     conductivityTransform(generalizedMean(lambda, -1), ct);
@@ -3659,62 +3171,16 @@ classdef ROM_SPDE < handle
                     conductivityTransform(generalizedMean(lambda, 1), ct);
                 nFeatures = nFeatures + 1;
 
-%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-%                     conductivities, 'hi', 'ConvexArea', 'max') + log_cutoff);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-%                     conductivities, 'lo', 'ConvexArea', 'max') + log_cutoff);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-%                     conductivities, 'hi', 'ConvexArea', 'var') + log_cutoff);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-%                     conductivities, 'lo', 'ConvexArea', 'var') + log_cutoff);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-%                     conductivities, 'hi', 'ConvexArea', 'mean') + log_cutoff);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) log(meanImageProps(lambda,...
-%                     conductivities, 'lo', 'ConvexArea', 'mean') + log_cutoff);
-%                 nFeatures = nFeatures + 1;
                 
-%                 phi{k, nFeatures + 1} = @(lambda) ...
-%                     connectedPathExist(lambda, 1, conductivities,'x','invdist');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) ...
-%                     connectedPathExist(lambda, 1, conductivities,'y','invdist');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) ...
-%                     connectedPathExist(lambda, 2, conductivities,'x','invdist');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) ...
-%                     connectedPathExist(lambda, 2, conductivities,'y','invdist');
-%                 nFeatures = nFeatures + 1;
-%                 
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     log(specificSurface(lambda, 1, conductivities, nElf) ...
-%                     + log_cutoff);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda)...
-%                     log(specificSurface(lambda, 2, conductivities, nElf) ...
-%                     + log_cutoff);
-%                 nFeatures = nFeatures + 1;
-
-                
-                phi{k, nFeatures + 1} = @(lambda)...
-                    gaussLinFilt(lambda, nan, 1);
+                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 1);
                 nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    gaussLinFilt(lambda, nan, 2);
+                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 2);
                 nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    gaussLinFilt(lambda, nan, 4);
+                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 4);
                 nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    gaussLinFilt(lambda, nan, 8);
+                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 8);
                 nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    gaussLinFilt(lambda, nan, 16);
+                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 16);
                 nFeatures = nFeatures + 1;
 
                 phi{k, nFeatures + 1} = @(lambda) std(lambda(:));
@@ -3764,116 +3230,11 @@ classdef ROM_SPDE < handle
                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
                     lambda, 1, 'upper');
                 nFeatures = nFeatures + 1;
-                
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'hi', 'euclidean', 'mean');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'hi', 'euclidean', 'var');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'hi', 'euclidean', 'max');
-%                 nFeatures = nFeatures + 1;
-%                 
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'hi', 'cityblock', 'mean');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'hi', 'cityblock', 'var');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'hi', 'cityblock', 'max');
-%                 nFeatures = nFeatures + 1;
-%                 
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'hi', 'chessboard', 'mean');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'hi', 'chessboard', 'var');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'hi',...
-%                     'chessboard', 'max');
-%                 nFeatures = nFeatures + 1;
-% 
-%                 
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'lo', 'euclidean', 'mean');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'lo', 'euclidean', 'var');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'lo', 'euclidean', 'max');
-%                 nFeatures = nFeatures + 1;
-%                 
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'lo', 'cityblock', 'mean');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'lo', 'cityblock', 'var');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'lo', 'cityblock', 'max');
-%                 nFeatures = nFeatures + 1;
-%                 
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'lo', 'chessboard', 'mean');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'lo', 'chessboard', 'var');
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) distanceProps(...
-%                     lambda, conductivities, 'lo', 'chessboard', 'max');
-%                 nFeatures = nFeatures + 1;
-
-                %Dummy random features
-%                 phi{k, nFeatures + 1} = @(lambda) normrnd(0, 1);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) normrnd(0, 1);
-%                 nFeatures = nFeatures + 1;
-%                 phi{k, nFeatures + 1} = @(lambda) normrnd(0, 1);
-%                 nFeatures = nFeatures + 1;
             end
             
             %Global features
             for k = 1:self.coarseMesh.nEl
                 nGlobalFeatures = 0;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda) ...
-%                     connectedPathExist(lambda, 2, conductivities, 'x',...
-%                     'invdist');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda) ...
-%                     connectedPathExist(lambda, 2, conductivities, 'y',...
-%                     'invdist');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-%                     maxExtent(lambda, conductivities, 'hi', 'x');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-%                     maxExtent(lambda, conductivities, 'hi', 'y');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-%                     maxExtent(lambda, conductivities, 'lo', 'x');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-%                     maxExtent(lambda, conductivities, 'lo', 'y');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-%                     SCA(lambda, conductivities, ct);
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-%                     maxwellGarnett(lambda, conductivities, ct, 'lo');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-%                     maxwellGarnett(lambda, conductivities, ct, 'hi');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-%                     differentialEffectiveMedium(lambda, conductivities,ct,'lo');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
-%                 phiGlobal{k, nGlobalFeatures + 1} = @(lambda)...
-%                     differentialEffectiveMedium(lambda, conductivities,ct,'hi');
-%                 nGlobalFeatures = nGlobalFeatures + 1;
             end
             
             pltPca = false;
@@ -3907,51 +3268,10 @@ classdef ROM_SPDE < handle
             end
             
             self.secondOrderTerms = zeros(nFeatures, 'logical');
-            assert(sum(sum(tril(self.secondOrderTerms, -1))) == 0,...
-                'Second order matrix must be upper triangular')
-            
-            
-            %Convection features
-            phiConvection = {};
+            assert(sum(sum(tril(self.secondOrderTerms, -1))) == 0, 'Second order matrix must be upper triangular')
             
             self.featureFunctions = phi;
             self.globalFeatureFunctions = phiGlobal;
-            self.convectionFeatureFunctions = phiConvection;
-            phiGlobalConvection = {};
-            self.globalConvectionFeatureFunctions = phiGlobalConvection;
-            
-            %add previously learned linear filters
-            if(~isempty(self.linFilt))
-                if(self.linFilt.totalUpdates > 0)
-                    if exist('./data/w.mat', 'file')
-                        load('./data/w.mat');   %to load w_all
-                        for i = 1:size(w_all, 2)
-                            for m = 1:self.coarseMesh.nEl
-                                self.featureFunctions{m, nFeatures + 1} =...
-                                    @(lambda) sum(w_all{m, i}'.*...
-                                    conductivityTransform(lambda(:),...
-                                    self.conductivityTransformation));
-                            end
-                            nFeatures = nFeatures + 1;
-                        end
-                    end
-                    
-                    if exist('./data/wGlobal.mat', 'file')
-                        %to load w_allGlobal, i.e. global linear filters
-                        load('./data/wGlobal.mat');
-                        for i = 1:size(w_allGlobal, 2)
-                            for m = 1:self.coarseMesh.nEl
-                                self.globalFeatureFunctions{...
-                                    m, nGlobalFeatures + 1} = @(lambda)...
-                                    sum(w_allGlobal{m, i}'.*...
-                                    conductivityTransform(lambda(:),...
-                                    self.conductivityTransformation));
-                            end
-                            nGlobalFeatures = nGlobalFeatures + 1;
-                        end
-                    end
-                end
-            end
         end
 
         function setCoarseGrid(self, coarseGridX, coarseGridY)

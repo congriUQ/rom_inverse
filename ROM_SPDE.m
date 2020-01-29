@@ -37,7 +37,7 @@ classdef ROM_SPDE < handle
         outputVariance
         outputMean
         meanOutputVariance
-        E                   %Mapping from fine to coarse cell index
+        coarseCellMask          %Mask to get fine scale pixels of coarse cell
         neighborDictionary %Gives neighbors of macrocells
         %% Model training parameters
         nStart = 1              %first training data sample in file
@@ -55,7 +55,6 @@ classdef ROM_SPDE < handle
         %Principal components of single macro-cell used as features
         localPcaComponents = 7
         pcaSamples = 4096
-        secondOrderTerms
         mix_S = 0             %To slow down convergence of S
         mix_theta = 0
         mix_sigma = 0
@@ -79,15 +78,12 @@ classdef ROM_SPDE < handle
         conductivityTransformation
         latentDim = 0              %If autoencoder is used
         sumPhiTPhi             %Design matrix precomputation
-        %How many pixels around macro-cell 
-        %should be considered in local features?
-        padding = 0
         
         %% Feature function rescaling parameters
         %'standardize' for zero mean and unit variance of features, 'rescale' 
         %to have all between 0 and 1, 'normalize' to have unit variance only
         %(and same mean as before)
-        featureScaling = 'normalize'
+%         featureScaling = 'normalize'
         featureFunctionMean
         featureFunctionSqMean
         featureFunctionMin
@@ -121,7 +117,7 @@ classdef ROM_SPDE < handle
         %% Finescale data
         lambdak
         xk
-        conductivityBasisFunctions      %handle to cinductivity basis functions
+        conductivityBasisFunctions      %handle to conductivity basis functions
         conductivityCoefficients
         
         %% Computational quantities
@@ -150,7 +146,7 @@ classdef ROM_SPDE < handle
         %for log normal length scale, the
         %length scale parameters are log normal mu and
         %sigma
-        conductivityDistributionParams = {-1 [.2 .2] 1}
+        conductivityDistributionParams = {-1 [.2 .2] 9}
         
         %Coefficients giving boundary conditions, specify as string
         boundaryConditions = '[0 1 1 0]'
@@ -180,24 +176,19 @@ classdef ROM_SPDE < handle
             
             %add needed paths
             addpath('./aux');
-            
             %set up path
             self.genFineScaleDataPath;
-            
             %Set handles to boundary condition functions
             self.genBoundaryConditionFunctions;
             self.naturalNodes = [2:(2*self.nElFX + 2*self.nElFY)];
-            
             %Set up coarseMesh; must be done after b.c.'s are set up
             self.genCoarseMesh;
-            
             %prealloc
             self.XMean = zeros(self.coarseMesh.nEl, self.nTrain);
             self.XSqMean = ones(self.coarseMesh.nEl, self.nTrain);
             %Set up default value for test samples
             self.nStart = randi(self.nSets(1) - self.nTrain, 1);
             self.trainingSamples = self.nStart:(self.nStart + self.nTrain - 1);
-            
             %Set conductivity transformation
             self.conductivityTransformation.anisotropy = false;
             self.conductivityTransformation.type = 'log';
@@ -311,6 +302,7 @@ classdef ROM_SPDE < handle
             else
                 error('Only fixed random field basis functions is implemented.')
             end
+            basisFuns = self.conductivityBasisFunctions;
             save(filename, 'xi', 'basisFuns', '-v7.3')
             
             cond = self.getDiscretizedConductivityField(xi);
@@ -439,7 +431,7 @@ classdef ROM_SPDE < handle
         
         function loadTrainingData(self)
             %load data params; warning for variable FD can be ignored
-            self.fineScaleDataPath
+            fprintf("\nloading data from \n" + self.fineScaleDataPath + "\n\n")
             load(self.fineScaleDataPath + "fineMesh.mat", "fineMesh");
             self.fineMesh = fineMesh;
             %for finescale domain class
@@ -467,13 +459,11 @@ classdef ROM_SPDE < handle
             nX = length(self.coarseGridVectorX);
             nY = length(self.coarseGridVectorY);
             addpath('./heatFEM')        %to find Domain class
-            self.coarseMesh =...
-                Domain(nX, nY, self.coarseGridVectorX, self.coarseGridVectorY);
+            self.coarseMesh = Domain(nX, nY, self.coarseGridVectorX, self.coarseGridVectorY);
             %ATTENTION: natural nodes have to be set manually
             %and consistently in coarse and fine scale domain!!
             self.coarseMesh.compute_grad = true;
-            self.coarseMesh =...
-                setBoundaries(self.coarseMesh, [2:(2*nX + 2*nY)],...
+            self.coarseMesh = setBoundaries(self.coarseMesh, [2:(2*nX + 2*nY)],...
                 self.boundaryTemperature, self.boundaryHeatFlux);
             
             %Legacy, for predictions
@@ -683,7 +673,8 @@ classdef ROM_SPDE < handle
         end
         
         function M_step(self)
-            disp('M-step: find optimal params...')
+            tic
+            fprintf("M-step: find optimal params...")
             %Optimal S (decelerated convergence)
             lowerBoundS = eps;
             self.theta_cf.S = (1 - self.mix_S)*self.varExpect_p_cf_exp_mean...
@@ -726,7 +717,7 @@ classdef ROM_SPDE < handle
                 (1 - self.mix_theta)*self.theta_c.theta +...
                 self.mix_theta*theta_old;
             
-            disp('M-step done')
+            fprintf("   M-step done. Time: %.2fs\n", toc)
         end
         
         function updateTheta_c(self)
@@ -1014,11 +1005,8 @@ classdef ROM_SPDE < handle
             elseif(strcmp(self.mode, 'useLocalNeighbor') ||...
                     strcmp(self.mode, 'useLocalDiagNeighbor'))
                 disp('theta feature coarseElement neighbor')
-                curr_theta =...
-                    [self.theta_c.theta(index),...
-                    self.neighborDictionary(index, 1),...
-                    self.neighborDictionary(index, 2),...
-                    self.neighborDictionary(index, 3)]
+                curr_theta = [self.theta_c.theta(index), self.neighborDictionary(index, 1),...
+                    self.neighborDictionary(index, 2), self.neighborDictionary(index, 3)]
             else
                 curr_theta = [self.theta_c.theta(index) index]
             end
@@ -1027,7 +1015,7 @@ classdef ROM_SPDE < handle
             if self.theta_c.full_Sigma
                 diag_sigma = diag(self.theta_c.Sigma)
             end
-            mean_S = mean(self.theta_cf.S)
+            fprintf("Mean reconstruction variance <S> = %f", mean(self.theta_cf.S))
             %curr_theta_hyperparam = obj.thetaPriorHyperparam
         end
         
@@ -1091,7 +1079,7 @@ classdef ROM_SPDE < handle
             %Function to predict finescale output from generative model
             
             if(nargin < 2)
-                mode = 'test';
+                mode = "test";
             end
             
             if(nargin > 2)
@@ -1502,7 +1490,8 @@ classdef ROM_SPDE < handle
         %% Design matrix functions
         function getCoarseElement(self)
             debug = false;
-            self.E = zeros(self.fineMesh.nEl, 1);
+            self.coarseCellMask = {zeros(self.fineMesh.nEl, 1, 'logical')};
+            self.coarseCellMask = repmat(self.coarseCellMask, self.coarseMesh.nEl, 1);
             e = 1;  %element number
             for row_fine = 1:self.fineMesh.nElY
                 %coordinate of lower boundary of fine element
@@ -1511,222 +1500,202 @@ classdef ROM_SPDE < handle
                 for col_fine = 1:self.fineMesh.nElX
                     %coordinate of left boundary of fine element
                     x_coord = self.fineMesh.cum_lElX(col_fine);
-                    col_coarse= sum(x_coord >= self.coarseMesh.cum_lElX);
-                    self.E(e) = (row_coarse - 1)*...
-                        self.coarseMesh.nElX + col_coarse;
+                    col_coarse = sum(x_coord >= self.coarseMesh.cum_lElX);
+                    self.coarseCellMask{(row_coarse - 1)*self.coarseMesh.nElX + col_coarse}(e) = true;
                     e = e + 1;
                 end
             end
             
-            self.E = reshape(self.E, self.fineMesh.nElX,...
-                self.fineMesh.nElY);
             if debug
                 figure
-                imagesc(self.E)
+%                 imagesc(E)
                 pause
             end
         end
 
-        function [lambdak, xk] = get_coarseElementConductivities(self, mode, samples)
+        function [lambdak, xk] = get_coarseElementConductivities(self, conductivity)
             %Cuts out conductivity fields from macro-cells
-			addpath('./rom');            
-
-            %load finescale conductivity field
-            if strcmp(mode, 'train')
-                if(nargin < 3)
-                    conductivity = ...
-                        self.trainingDataMatfile.cond(:, self.trainingSamples);
-                else
-                    %used for pca
-                    conductivity = self.trainingDataMatfile.cond(:, samples);
-                end
-            elseif strcmp(mode, 'test')
-                conductivity = self.testDataMatfile.cond(:, self.testSamples);
-            else
-                error('Either train or test mode')
-            end
+			addpath('./rom');    
+            
             nData = size(conductivity, 2);
             %Mapping from fine cell index to coarse cell index
             self.getCoarseElement;
-                        
-            %Open parallel pool
-            %addpath('./computation')
-            %parPoolInit(nTrain);
-            EHold = self.E;  %this is for parfor efficiency
-            
+                                    
             %prealloc
             lambdak = cell(nData, self.coarseMesh.nEl);
             if(nargout > 1)
                 xk = lambdak;
-                if(nargout > 2)
-                    ak = lambdak;
-                end
             end
             
             for s = 1:nData
-                %inputs belonging to same coarse element are in the 
-                %same column of xk. They are ordered in x-direction.
-                %Get conductivity fields in coarse cell windows
-                %Might be wrong for non-square fine scale domains
-                conductivityMat = reshape(conductivity(:, s),...
-                    self.fineMesh.nElX, self.fineMesh.nElY);
+                %inputs belonging to same coarse element are in the same column of xk. They are ordered in x-direction.
+                %Get conductivity fields in coarse cell windows. Might be wrong for non-square fine scale domains
+                conductivityMat = reshape(conductivity(:, s), self.fineMesh.nElX, self.fineMesh.nElY);
                 for e = 1:self.coarseMesh.nEl
-                    indexMat = (EHold == e);
-                    if self.padding
-                        indexMat = padIndexMat(indexMat, self.padding);
-                    end
-
-                    lambdakTemp = conductivityMat.*indexMat;
+%                     lambdakTemp = conductivityMat.*self.coarseCellMask{e};
+                    lambdakTemp = conductivityMat(self.coarseCellMask{e});
                     %Cut elements from matrix that do not belong to coarse cell
                     lambdakTemp(~any(lambdakTemp, 2), :) = [];
                     lambdakTemp(:, ~any(lambdakTemp, 1)) = [];
                     lambdak{s, e} = lambdakTemp;
                     if(nargout > 1)
-                        xk{s, e} = conductivityTransform(lambdak{s, e},...
-                            self.conductivityTransformation);
+                        xk{s, e} = conductivityTransform(lambdak{s, e}, self.conductivityTransformation);
                     end
                 end
             end
         end
         
-        function computeDesignMatrix(self, mode, recompute, xi)
-            %Actual computation of design matrix
-            %set recompute to true if design matrices have 
-            %to be recomputed during optimization (parametric features)
-            tic
+        function [Phi, d_Phi] = computeDesignMatrix(self, mode, recompute, xi)
+            %Actual computation of design matrix set recompute to true if design matrices have to be
+            %recomputed during optimization (parametric features)
             if(self.loadDesignMatrix && ~recompute && mode == "train")
                 load(strcat('./persistentData/', mode, 'DesignMatrix.mat'));
                 self.designMatrix = designMatrix;
             else
-                fprintf('Computing design matrices...\n')
+                if mode ~= "inverse"
+                    fprintf('Computing design matrices...\n')
+                    tic
+                end
                 
-                if strcmp(mode, 'train')
+                if mode == "train"
                     dataFile = self.trainingDataMatfile;
                     dataSamples = self.trainingSamples;
-                elseif strcmp(mode, 'test')
+                    d_Phi = [];
+                    nData = numel(dataSamples);
+                    self.getCoarseElement;
+                elseif mode == "test"
                     dataFile = self.testDataMatfile;
                     dataSamples = self.testSamples;
+                    d_Phi = [];
+                    nData = numel(dataSamples);
+                    self.getCoarseElement;
+                elseif mode == "inverse"
+                    %do nothing. Microstructures are not given by data
+                    nData = 1;
                 else
                     error('Compute design matrices for train or test data?')
                 end
-                nData = numel(dataSamples);
 
                 %Generate discretized conductivity field from basis functions
                 if nargin < 4
                     xi = dataFile.xi(dataSamples, :);
                 end
                 conductivity = self.getDiscretizedConductivityField(xi);
-                %to avoid parallelization communication overhead
-                conductivity = num2cell(conductivity, 1);
-                
+
                 %set feature function handles
-                [phi, phiGlobal] = self.setFeatureFunctions;
-                self.writeFeatureFunctionList(phi, phiGlobal);
-                
+                if isempty(self.featureFunctions) && isempty(self.globalFeatureFunctions)
+                    [phi, phiGlobal] = self.setFeatureFunctions;
+                else
+                    phi = self.featureFunctions;
+                    phiGlobal = self.globalFeatureFunctions;
+                    self.writeFeatureFunctionList(phi, phiGlobal);
+                end
+
                 nFeatureFunctions = size(self.featureFunctions, 2);
                 nGlobalFeatureFunctions = size(self.globalFeatureFunctions, 2);
-                
-                PhiCell{1} = zeros(self.coarseMesh.nEl, nFeatureFunctions + nGlobalFeatureFunctions);
-                [lambdak, xk] = self.get_coarseElementConductivities(mode);
-                PhiCell = repmat(PhiCell, nData, 1);
+                nFeaturesTot = nFeatureFunctions + nGlobalFeatureFunctions;
 
-                
-                %avoid broadcasting overhead
-                nElc = self.coarseMesh.nEl;
-                nElXf = self.fineMesh.nElX;
-                nElYf = self.fineMesh.nElY;
+                Phi{1} = zeros(self.coarseMesh.nEl, nFeaturesTot);
+%                 [lambdak, xk] = self.get_coarseElementConductivities(conductivity);
+                if mode == "inverse"
+                    %ONLY WORKS IF MACRO CELLS LAMBDAK HAVE IDENTICAL SIZES
+%                     d_Phi = zeros(self.coarseMesh.nEl*(nFeaturesTot), numel(lambdak{1, 1}));
+                    d_Phi = spalloc(self.coarseMesh.nEl*nFeaturesTot, self.fineMesh.nEl, numel(self.coarseCellMask{1}));
+                end
+                Phi = repmat(Phi, nData, 1);
+
                 %for cheap features, serial evaluation might be more efficient
                 for s = 1:nData
                     %inputs belonging to same coarse element are in 
                     %the same column of xk. They are ordered in x-direction.
                     
                     %construct conductivity design matrix
-                    for i = 1:self.coarseMesh.nEl
+                    for k = 1:self.coarseMesh.nEl
                         %local features
                         for j = 1:nFeatureFunctions
                             %only take pixels of corresponding macro-cell as input for features
-                            PhiCell{s}(i, j) = phi{i, j}(lambdak{s, i});
+                            if mode == "inverse"
+                                %FIXME: needs to be generalized for global feature functions
+%                                 [Phi{s}(k, j), d_Phi(((k - 1)*nFeaturesTot) + j, :)] = phi{k, j}(lambdak{s, k});
+                                [Phi{s}(k, j), d_Phi(((k - 1)*nFeaturesTot) + j, :)] =...
+                                    phi{j}(conductivity(:, s), self.coarseCellMask{k});
+                            else
+                                Phi{s}(k, j) = phi{j}(conductivity(:, s), self.coarseCellMask{k});
+                            end
                         end
                         %global features
                         for j = 1:nGlobalFeatureFunctions
                             %Take whole microstructure as input for feature function can be wrong
                             %for non-sq. fine domains
-                            conductivityMat = reshape(conductivity{s}, self.fineMesh.nElX, self.fineMesh.nElY);
-                            PhiCell{s}(i, nFeatureFunctions + j) = phiGlobal{i, j}(conductivityMat);
+                            conductivityMat = reshape(conductivity(:, s), self.fineMesh.nElX, self.fineMesh.nElY);
+                            Phi{s}(k, nFeatureFunctions + j) = phiGlobal{k, j}(conductivityMat);
                         end
                     end
                 end
                 
-                %Check for real finite inputs
-                for i = 1:nData
-                    if(~all(all(all(isfinite(PhiCell{i})))))
-                        dataPoint = i
-                        [coarseElement, featureFunction] =...
-                            ind2sub(size(PhiCell{i}),...
-                            find(~isfinite(PhiCell{i})))
-                        warning(strcat('Non-finite design matrix. Setting', ...
-                            'non-finite component to 0.'))
-                        PhiCell{i}(~isfinite(PhiCell{i})) = 0;
-                    elseif(~all(all(all(isreal(PhiCell{i})))))
-                        warning('Complex feature function output:')
-                        dataPoint = i
-                        [coarseElement, featureFunction] =...
-                            ind2sub(size(PhiCell{i}), find(imag(PhiCell{i})))
-                        disp('Ignoring imaginary part...')
-                        PhiCell{i} = real(PhiCell{i});
-                    end
-                end
-                disp('done')
+                self.designMatrixTest(Phi);
                 
-                if strcmp(mode, 'train')
-                    self.designMatrix = PhiCell;
-                elseif strcmp(mode, 'test')
-                    self.testDesignMatrix = PhiCell;
-                else
-                    error('Wrong design matrix computation model')
-                end
-                
-                %Include second order combinations of features
-                if(any(any(self.secondOrderTerms)))
-                    self = self.secondOrderFeatures(mode);
-                end
-                if strcmp(mode, 'train')
-                    PhiCell = self.designMatrix;
-                elseif strcmp(mode, 'test')
-                    PhiCell = self.testDesignMatrix;
+                if mode == "train"
+                    self.designMatrix = Phi;
+                elseif mode == "test"
+                    self.testDesignMatrix = Phi;
+                elseif mode == "inverse"
+                    %pass
                 else
                     error('Wrong design matrix computation model')
                 end
                                 
-                %Design matrix is always stored in its original form.
-                %Local modes are applied after loading
+                %Design matrix is always stored in its original form. Local modes are applied after loading.
                 if strcmp(mode, 'train')
                     designMatrix = self.designMatrix;
                     self.originalDesignMatrix = self.designMatrix;
                     save(strcat('./persistentData/', mode, 'DesignMatrix.mat'), 'designMatrix')
                 end
             end
-
             
+            self.applyLocalityModeToDesignMatrix(Phi, mode);
+            if mode ~= "inverse"
+                self.computeSumPhiTPhi;
+                fprintf('design matrices computed.\n')
+                fprintf("Design matrix computation time: %.2f\n", toc)
+            end
+        end
+        
+        function applyLocalityModeToDesignMatrix(self, Phi, mode)
             %Use specific nonlocality mode
             if strcmp(self.mode, 'useNeighbor')
                 %use feature function information from nearest neighbors
-                self.includeNearestNeighborFeatures(PhiCell, mode);
+                self.includeNearestNeighborFeatures(Phi, mode);
             elseif strcmp(self.mode, 'useLocalNeighbor')
-                self.includeLocalNearestNeighborFeatures(PhiCell, mode);
+                self.includeLocalNearestNeighborFeatures(Phi, mode);
             elseif strcmp(self.mode, 'useLocalDiagNeighbor')
-                self.includeLocalDiagNeighborFeatures(PhiCell, mode);
+                self.includeLocalDiagNeighborFeatures(Phi, mode);
             elseif strcmp(self.mode, 'useDiagNeighbor')
                 %use feature function info from nearest and diagonal neighbors
-                self.includeDiagNeighborFeatures(PhiCell, mode);
+                self.includeDiagNeighborFeatures(Phi, mode);
             elseif strcmp(self.mode, 'useLocal')
                 %Use separate parameters for every macro-cell
-                self.localTheta_c(PhiCell, mode);
+                self.localTheta_c(Phi, mode);
             else
                 self.originalDesignMatrix = [];
             end
-            self.computeSumPhiTPhi;
-            fprintf("Design matrix computation time: %.2f\n", toc)
+        end
+        
+        function designMatrixTest(self, Phi)
+            %Check for real finite inputs
+            for i = 1:numel(Phi)
+                if(~all(all(all(isfinite(Phi{i})))))
+                    [coarseElement, featureFunction] = ind2sub(size(Phi{i}), find(~isfinite(Phi{i})));
+                    warning("Non-finite design matrix at data point %u, element %u, feature %u" +...
+                        "Setting non-finite component to 0.", i, coarseElement, featureFunction)
+                    Phi{i}(~isfinite(Phi{i})) = 0;
+                elseif(~all(all(all(isreal(Phi{i})))))
+                    [coarseElement, featureFunction] = ind2sub(size(Phi{i}), find(imag(Phi{i})));
+                    warning("Complex design matrix at data point %u, element %u, feature %u" +...
+                        "Setting imaginary part to 0.", i, coarseElement, featureFunction)
+                    Phi{i} = real(Phi{i});
+                end
+            end
         end
         
         function applyDesignMatrixNormalization(self, mode)
@@ -1760,64 +1729,6 @@ classdef ROM_SPDE < handle
                 dlmwrite('./data/features', func2str(phiGlobal{1, j}), 'delimiter', '', '-append');
             end
         end
-        
-        function secondOrderFeatures(self, mode)
-            %Includes second order multinomial terms, i.e. a_ij phi_i phi_j, 
-            %where a_ij is logical. Squared term phi_i^2 if a_ii ~= 0. 
-            %To be executed directly after feature function computation.
-            
-            assert(all(all(islogical(self.secondOrderTerms))),...
-                'A must be a logical array of nFeatures x nFeatures')
-            %Consider every term only once
-            assert(sum(sum(tril(self.secondOrderTerms, -1))) == 0,...
-                'Matrix A must be upper triangular')
-            
-            nFeatureFunctions = size(self.featureFunctions, 2) + size(self.globalFeatureFunctions, 2);
-
-            nSecondOrderTerms = sum(sum(self.secondOrderTerms));
-            if nSecondOrderTerms
-                disp('Using second order terms of feature functions...')
-            end
-            PhiCell{1} = zeros(self.coarseMesh.nEl,...
-                nSecondOrderTerms + nFeatureFunctions);
-            if strcmp(mode, 'train')
-                nData = self.nTrain;
-            elseif strcmp(mode, 'test')
-                nData = numel(self.testSamples);
-            end
-            PhiCell = repmat(PhiCell, nData, 1);
-            
-            for s = 1:nData
-                %The first columns contain first order terms
-                if strcmp(mode, 'train')
-                    PhiCell{s}(:, 1:nFeatureFunctions) = self.designMatrix{s};
-                elseif strcmp(mode, 'test')
-                    PhiCell{s}(:, 1:nFeatureFunctions)=self.testDesignMatrix{s};
-                else
-                    error('wrong mode')
-                end
-                
-                %Second order terms
-                f = 1;
-                for r = 1:size(self.secondOrderTerms, 1)
-                    for c = r:size(self.secondOrderTerms, 2)
-                        if self.secondOrderTerms(r, c)
-                            PhiCell{s}(:, nFeatureFunctions + f) = ...
-                                PhiCell{s}(:, r).*PhiCell{s}(:, c);
-                            f = f + 1;
-                        end
-                    end
-                end
-            end
-            if strcmp(mode, 'train')
-                self.designMatrix = PhiCell;
-            elseif strcmp(mode, 'test')
-                self.testDesignMatrix = PhiCell;
-            else
-                error('wrong mode');
-            end
-            disp('done')
-        end%secondOrderFeatures
         
         function computeFeatureFunctionMean(self)
             %Must be executed BEFORE useLocal etc.
@@ -3049,7 +2960,7 @@ classdef ROM_SPDE < handle
         
         function pcaComponents = globalPCA(self)
             %Compute PCA on global microstructure - load when file exists
-            disp('Performing PCA on global microstructure...')
+            fprintf('Performing PCA on global microstructure...')
             if exist(strcat(self.fineScaleDataPath, 'globalPCA.mat'), 'file')
                 load(strcat(self.fineScaleDataPath, 'globalPCA.mat'));
             else
@@ -3077,15 +2988,14 @@ classdef ROM_SPDE < handle
                 end
                 drawnow
             end
-            disp('done')
+            fprintf('   done.\n')
         end
         
         function pcaComponents = localPCA(self)
             %Perform PCA on local macro-cells
             
-            disp('Performing PCA on every macro-cell...')
-            filename = strcat(self.fineScaleDataPath, 'localPCA',...
-                num2str(self.coarseGridVectorX),...
+            fprintf('Performing PCA on every macro-cell...')
+            filename = strcat(self.fineScaleDataPath, 'localPCA', num2str(self.coarseGridVectorX),...
                    num2str(self.coarseGridVectorY), '.mat');
             if exist(filename, 'file')
                 load(filename);
@@ -3094,8 +3004,8 @@ classdef ROM_SPDE < handle
                     self.pcaSamples = size(self.trainingDataMatfile.cond, 2);
                     warning('Less samples than specified are available for PCA')
                 end
-                lambdak = self.get_coarseElementConductivities('train',...
-                    1:self.pcaSamples);
+                conductivity_pca = self.trainingDataMatfile.cond(:, 1:self.pcaSamples);
+                lambdak = self.get_coarseElementConductivities(conductivity_pca);
                 averageMacroCells = true;
                 if averageMacroCells
                     iter = 1;
@@ -3136,7 +3046,7 @@ classdef ROM_SPDE < handle
                 end
                 drawnow
             end
-            disp('done')
+            fprintf('   done.\n')
         end
 
         function [phi, phiGlobal] = setFeatureFunctions(self)
@@ -3153,124 +3063,115 @@ classdef ROM_SPDE < handle
             for k = 1:self.coarseMesh.nEl
                 nFeatures = 0;
                 %constant bias
-                phi{k, nFeatures + 1} = @(lambda) 1;
+                phi{nFeatures + 1} = @(lambda, mask) constant(lambda, mask);
                 nFeatures = nFeatures + 1;
 
-                phi{k, nFeatures + 1} = @(lambda)...
-                    conductivityTransform(generalizedMean(lambda, -1), ct);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    conductivityTransform(generalizedMean(lambda, -.5), ct);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    conductivityTransform(generalizedMean(lambda, 0), ct);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    conductivityTransform(generalizedMean(lambda, .5), ct);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda)...
-                    conductivityTransform(generalizedMean(lambda, 1), ct);
-                nFeatures = nFeatures + 1;
-
-                
-                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 1);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 2);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 4);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 8);
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 16);
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     conductivityTransform(generalizedMean(lambda, -1), ct);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     conductivityTransform(generalizedMean(lambda, -.5), ct);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     conductivityTransform(generalizedMean(lambda, 0), ct);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda)...
+%                     conductivityTransform(generalizedMean(lambda, .5), ct);
+%                 nFeatures = nFeatures + 1;
+                phi{nFeatures + 1} = @(lambda, mask) generalizedMean(lambda, mask, 1);
                 nFeatures = nFeatures + 1;
 
-                phi{k, nFeatures + 1} = @(lambda) std(lambda(:));
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) log(std(lambda(:)) +...
-                    log_cutoff);
-                nFeatures = nFeatures + 1;
                 
-                phi{k, nFeatures + 1} = @(lambda) isingEnergy(lambda);
-                nFeatures = nFeatures + 1;
-                
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, -1, 'left');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, -1, 'lower');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, -1, 'right');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, -1, 'upper');
-                nFeatures = nFeatures + 1;
-                
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, 0, 'left');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, 0, 'lower');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, 0, 'right');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, 0, 'upper');
-                nFeatures = nFeatures + 1;
-                
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, 1, 'left');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, 1, 'lower');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, 1, 'right');
-                nFeatures = nFeatures + 1;
-                phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
-                    lambda, 1, 'upper');
-                nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 1);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 2);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 4);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 8);
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) gaussLinFilt(lambda, nan, 16);
+%                 nFeatures = nFeatures + 1;
+% 
+%                 phi{k, nFeatures + 1} = @(lambda) std(lambda(:));
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) log(std(lambda(:)) +...
+%                     log_cutoff);
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda) isingEnergy(lambda);
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, -1, 'left');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, -1, 'lower');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, -1, 'right');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, -1, 'upper');
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, 0, 'left');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, 0, 'lower');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, 0, 'right');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, 0, 'upper');
+%                 nFeatures = nFeatures + 1;
+%                 
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, 1, 'left');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, 1, 'lower');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, 1, 'right');
+%                 nFeatures = nFeatures + 1;
+%                 phi{k, nFeatures + 1} = @(lambda) generalizedMeanBoundary(...
+%                     lambda, 1, 'upper');
+%                 nFeatures = nFeatures + 1;
             end
             
-            %Global features
-            for k = 1:self.coarseMesh.nEl
-                nGlobalFeatures = 0;
-            end
-            
-            pltPca = false;
-            %Unsupervised pretraining: compute PCA components
-            if(self.globalPcaComponents > 0)
-                globalComponents = self.globalPCA;
-            end
-            %PCA projection
-            for n = 1:self.globalPcaComponents
-                for k = 1:self.coarseMesh.nEl
-                    phiGlobal{k, nGlobalFeatures + n} = @(lambda)...
-                        globalComponents(:, n)'*lambda(:);
-                end
-            end
-            
-            %local PCA projection
-            if(self.localPcaComponents > 0)
-                localComponents = self.localPCA;
-                for n = 1:self.localPcaComponents
-                    for k = 1:self.coarseMesh.nEl
-                        if(ndims(localComponents) == 3)
-                            %Separate PCA on every macro cell
-                            phi{k, nFeatures + n} = @(lambda)...
-                                localComponents(:, n, k)'*lambda(:);
-                        else
-                            phi{k, nFeatures + n} = @(lambda)...
-                                localComponents(:, n)'*lambda(:);
-                        end
-                    end
-                end
-            end
-            
-            self.secondOrderTerms = zeros(nFeatures, 'logical');
-            assert(sum(sum(tril(self.secondOrderTerms, -1))) == 0, 'Second order matrix must be upper triangular')
-            
+%             nGlobalFeatures = 0;
+%             %Unsupervised pretraining: compute PCA components
+%             if(self.globalPcaComponents > 0)
+%                 globalComponents = self.globalPCA;
+%             end
+%             %PCA projection
+%             for n = 1:self.globalPcaComponents
+%                 for k = 1:self.coarseMesh.nEl
+%                     phiGlobal{k, nGlobalFeatures + n} = @(lambda)...
+%                         globalComponents(:, n)'*lambda(:);
+%                 end
+%             end
+%             
+%             %local PCA projection
+%             if(self.localPcaComponents > 0)
+%                 localComponents = self.localPCA;
+%                 for n = 1:self.localPcaComponents
+%                     for k = 1:self.coarseMesh.nEl
+%                         if(ndims(localComponents) == 3)
+%                             %Separate PCA on every macro cell
+%                             phi{k, nFeatures + n} = @(lambda)...
+%                                 localComponents(:, n, k)'*lambda(:);
+%                         else
+%                             phi{k, nFeatures + n} = @(lambda)...
+%                                 localComponents(:, n)'*lambda(:);
+%                         end
+%                     end
+%                 end
+%             end
+                        
             self.featureFunctions = phi;
             self.globalFeatureFunctions = phiGlobal;
         end

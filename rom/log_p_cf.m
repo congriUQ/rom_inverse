@@ -1,11 +1,11 @@
-function [log_p, d_log_p, Tc] = log_p_cf(Tf_i_minus_mu, domainc, Xi, theta_cf, condTransOpts, onlyGrad)
+function [log_p, d_log_p, Tc] = log_p_cf(Tf_i_minus_mu, coarseMesh, Xi, theta_cf, condTransOpts, onlyGrad)
 %Coarse-to-fine map
 %ignore constant prefactor
 %log_p = -.5*logdet(S, 'chol') - .5*(Tf - mu)'*(S\(Tf - mu));
 %diagonal S
 
 conductivity = conductivityBackTransform(Xi, condTransOpts);
-FEMout = heat2d(domainc, conductivity);
+FEMout = heat2d(coarseMesh, conductivity);
 
 Tc = FEMout.u;
 Tf_i_minus_mu_minus_WTc = Tf_i_minus_mu - theta_cf.W*Tc;
@@ -21,12 +21,12 @@ if nargout > 1
     %Gradient of FEM equation system w.r.t. conductivities
 
 %     d_r = FEMgrad(FEMout, domainc, conductivity);
-    d_r = FEMgrad2(FEMout.naturalTemperatures, domainc);
+    d_r = FEMgrad2(FEMout.naturalTemperatures, coarseMesh);
 %     d_rx = d_r;
     if strcmp(condTransOpts.type, 'log')
         %We need gradient of r w.r.t. log conductivities X, multiply 
         %each row with resp. conductivity
-        d_rx(1:domainc.nEl, :) = conductivity.*d_r(1:domainc.nEl, :);
+        d_rx(1:coarseMesh.nEl, :) = conductivity.*d_r(1:coarseMesh.nEl, :);
     elseif strcmp(condTransOpts.type, 'logit')
         %We need gradient w.r.t. x, where x is
         %- log((lambda_up - lambda_lo)/(lambda - lambda_lo) - 1)
@@ -36,14 +36,14 @@ if nargout > 1
     elseif strcmp(condTransOpts.type, 'log_lower_bound')
         %transformation is X = log(Lambda - lambda_lo)
         dLambda_dX = conductivity - condTransOpts.limits(1);
-        d_rx(1:domainc.nEl, :) = diag(dLambda_dX)*d_r(1:domainc.nEl, :);
+        d_rx(1:coarseMesh.nEl, :) = diag(dLambda_dX)*d_r(1:coarseMesh.nEl, :);
     elseif strcmp(condTransOpts.type, 'square')
         %We need gradient of r w.r.t. sqrt conductivities X. d/dX = 2X d/dlambda
-        d_rx(1:domainc.nEl, :) = diag(2*Xi(1:domainc.nEl))*d_r(1:domainc.nEl, :);
+        d_rx(1:coarseMesh.nEl, :) = diag(2*Xi(1:coarseMesh.nEl))*d_r(1:coarseMesh.nEl, :);
     else
         error('Unknown conductivity transformation')
     end
-    adjoints = get_adjoints(FEMout.globalStiffness, theta_cf, domainc, Tf_i_minus_mu_minus_WTc);
+    adjoints = get_adjoints(FEMout.globalStiffness, theta_cf, coarseMesh, Tf_i_minus_mu_minus_WTc);
     d_log_p = - d_rx*adjoints;
 
     
@@ -52,16 +52,16 @@ if nargout > 1
     if FDcheck
         disp('Gradient check log p_cf')
         d = 1e-8;
-        FDgrad = zeros(domainc.nEl, 1);
-        for e = 1:domainc.nEl
+        FDgrad = zeros(coarseMesh.nEl, 1);
+        for e = 1:coarseMesh.nEl
             conductivityFD = conductivity;
             conductivityFD(e) = conductivityFD(e) + d;
             
-            DFD = zeros(2, 2, domainc.nEl);
-            for j = 1:domainc.nEl
+            DFD = zeros(2, 2, coarseMesh.nEl);
+            for j = 1:coarseMesh.nEl
                 DFD(:, :, j) =  conductivityFD(j)*eye(2);
             end
-            FEMoutFD = heat2d(domainc, DFD);
+            FEMoutFD = heat2d(coarseMesh, DFD);
             checkLocalStiffness = false;
             if checkLocalStiffness
                 k = FEMout.diffusionStiffness(:, :, e);

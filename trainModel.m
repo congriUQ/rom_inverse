@@ -2,7 +2,7 @@
 %% Preamble
 tic;    %measure runtime
 clear;
-datestr(now, 'mmddHHMMSS')  %Print datestring to pipe
+fprintf("timestamp: " + datestr(now, 'mmddHHMMSS') + "\n")  %Print datestring to pipe
 restoredefaultpath
 addpath('./params')
 addpath('./aux')
@@ -54,7 +54,6 @@ end
 %% EM optimization - main body
 rom.EM_iterations = 1;          %EM iteration index
 collectData;    %Write initial parametrizations to disk
-
 Xmax{1} = 0;
 Xmax = repmat(Xmax, rom.nTrain, 1);
 while true
@@ -82,17 +81,14 @@ while true
             cm(i) = rom.coarseMesh;
             cm(i) = cm(i).setBoundaries([2:(2*nX + 2*nY)], bcT, bcQ);
             cd_i = cm(i);
-            log_qi{i} = @(Xi)...
-                log_q_i(Xi, Tf_i_minus_mu, tcf, tc, PhiMat, cd_i, ct, true);
+            log_qi{i} = @(Xi) log_q_i(Xi, Tf_i_minus_mu, tcf, tc, PhiMat, cd_i, ct, true);
             log_qi_max{i} = @(Xi)...
                 log_q_i(Xi, Tf_i_minus_mu, tcf, tc, PhiMat, cd_i, ct, false);
         else
             %Every coarse model has the same boundary conditions
             cm = rom.coarseMesh;
-            log_qi{i} = @(Xi)...
-                log_q_i(Xi, Tf_i_minus_mu, tcf, tc, PhiMat, cm, ct, true);
-            log_qi_max{i} = @(Xi)...
-                log_q_i(Xi, Tf_i_minus_mu, tcf, tc, PhiMat, cm, ct, false);
+            log_qi{i} = @(Xi) log_q_i(Xi, Tf_i_minus_mu, tcf, tc, PhiMat, cm, ct, true);
+            log_qi_max{i} = @(Xi) log_q_i(Xi, Tf_i_minus_mu, tcf, tc, PhiMat, cm, ct, false);
         end
         
         
@@ -264,18 +260,14 @@ while true
             
             Tf_i_minus_mu = rom.fineScaleDataOutput(:, i) - rom.theta_cf.mu;
             if(any(rom.boundaryConditionVariance))
-                p_cf_expHandle{i} = @(X) sqMisfit(X,...
-                    rom.conductivityTransformation,...
-                    cm(i), Tf_i_minus_mu, rom.theta_cf);
+                p_cf_expHandle{i} =...
+                    @(X) sqMisfit(X, rom.conductivityTransformation, cm(i), Tf_i_minus_mu, rom.theta_cf);
             else
-                p_cf_expHandle{i} = @(X) sqMisfit(X,...
-                    rom.conductivityTransformation,...
-                    cm, Tf_i_minus_mu, rom.theta_cf);
+                p_cf_expHandle{i} = @(X) sqMisfit(X, rom.conductivityTransformation, cm, Tf_i_minus_mu, rom.theta_cf);
             end
             %Expectations under variational distributions
             if rom.free_W
-                [p_cf_exp, Tc_i, TcTcT_i] = mcInference(p_cf_expHandle{i},...
-                    variationalDist, varDistParams{i});
+                [p_cf_exp, Tc_i, TcTcT_i] = mcInference(p_cf_expHandle{i}, variationalDist, varDistParams{i});
                 Tc(:, i) = Tc_i;
                 TcTcT(:, :, i) = TcTcT_i;
             else
@@ -286,8 +278,7 @@ while true
         if rom.free_W
             rom.mean_TfTcT = 0;
             for i = 1:rom.nTrain
-                rom.mean_TfTcT = (1/i)*((i - 1)*rom.mean_TfTcT +...
-                    rom.fineScaleDataOutput(:, i)*Tc(:, i)');
+                rom.mean_TfTcT = (1/i)*((i - 1)*rom.mean_TfTcT + rom.fineScaleDataOutput(:, i)*Tc(:, i)');
             end
             rom.mean_TcTcT = mean(TcTcT, 3);
         end
@@ -300,9 +291,7 @@ while true
     end
 
     %M-step: determine optimal parameters given the sample set
-    tic
     rom.M_step;
-    fprintf("M-step time: %.2fs\n", toc)
     fprintf("Number of iterations: %u\n", rom.EM_iterations)
     fprintf("Number of epochs: %u\n", rom.epoch)
     rom.dispCurrentParams;

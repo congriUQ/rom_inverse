@@ -597,7 +597,7 @@ classdef Domain
             self.d_glob_stiff = [];
             self.d_glob_stiff_assemble = spalloc(self.nEq*self.nEq, self.nEl, 16*self.nEl);
             kIndexMat = sparse(1:length(self.kIndex), self.kIndex, ones(1, length(self.kIndex)));
-            fprintf("Setting up stiffness stencil, this may take a while...\n")
+            fprintf("Setting up stiffness stencil, this may take a while...")
             tic
             for e = 1:self.nEl
 %                 grad_loc_k = zeros(4, 4, self.nEl);
@@ -614,7 +614,7 @@ classdef Domain
                 self.d_glob_stiff_assemble(:, e) = sparse(d_Ke(:));
             end
             t = toc;
-            fprintf('...stiffness stencil set up. Time: %.2fs\n', t)
+            fprintf('   done. Time: %.2fs\n', t)
             self.d_glob_stiff_assemble = sparse(self.d_glob_stiff_assemble);
         end
         

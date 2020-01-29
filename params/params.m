@@ -22,17 +22,15 @@ if loadOldConf
 else
     rom.theta_cf.S = 1e3*ones(rom.fineMesh.nNodes, 1);
     rom.theta_cf.mu = zeros(rom.fineMesh.nNodes, 1);
-    nSecondOrderTerms = sum(sum(rom.secondOrderTerms));
     rom.theta_c.theta = 0*ones(size(rom.featureFunctions, 2) +...
-        size(rom.globalFeatureFunctions, 2) + nSecondOrderTerms, 1);
+        size(rom.globalFeatureFunctions, 2), 1);
     rom.theta_c.Sigma = 1e0*speye(rom.coarseMesh.nEl);
     %s = diag(rom.theta_c.Sigma);
     %rom.theta_c.SigmaInv = sparse(diag(1./s));
     rom.theta_c.SigmaInv = inv(rom.theta_c.Sigma);
     rom.theta_c.full_Sigma = false;
 end
-rom.theta_cf.Sinv =...
-    sparse(1:rom.fineMesh.nNodes, 1:rom.fineMesh.nNodes, 1./rom.theta_cf.S);
+rom.theta_cf.Sinv = sparse(1:rom.fineMesh.nNodes, 1:rom.fineMesh.nNodes, 1./rom.theta_cf.S);
 rom.theta_cf.Sinv_vec = 1./rom.theta_cf.S;
 %precomputation to save resources
 rom.theta_cf.WTSinv = rom.theta_cf.W'*rom.theta_cf.Sinv;

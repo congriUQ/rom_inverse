@@ -1,5 +1,4 @@
-function [log_q, d_log_q, Tc] = log_q_i(Xi, Tf_i_minus_mu, theta_cf, theta_c,...
-    Phi,  domainc, condTransOpts, onlyGrad)
+function [log_q, d_log_q, Tc] = log_q_i(Xi, Tf_i_minus_mu, theta_cf, theta_c, Phi,  domainc, condTransOpts, onlyGrad)
 
 %Xi must be a column vector
 if size(Xi, 2) > 1
@@ -7,8 +6,7 @@ if size(Xi, 2) > 1
 end
 
 [lg_p_c, d_lg_p_c] = log_p_c(Xi, Phi, theta_c);
-[lg_p_cf, d_lg_p_cf, Tc] = log_p_cf(Tf_i_minus_mu, domainc, Xi, theta_cf,...
-    condTransOpts, onlyGrad);
+[lg_p_cf, d_lg_p_cf, Tc] = log_p_cf(Tf_i_minus_mu, domainc, Xi, theta_cf, condTransOpts, onlyGrad);
 
 log_q = lg_p_cf + lg_p_c;
 d_log_q = d_lg_p_c + d_lg_p_cf;
